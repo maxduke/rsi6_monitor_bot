@@ -1,0 +1,7 @@
+python-telegram-bot[job-queue]
+akshare
+pandas
+pandas-ta
+pytz
+numpy<2.0
+pandas_market_calendars

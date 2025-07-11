@@ -1,0 +1,63 @@
+name: Build and Push Multi-Arch Docker Image
+
+# 当有代码推送到 main 分支时触发
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # <--- 必需：授予工作流写入 GitHub Packages 的权限
+
+    steps:
+      # 1. 检出代码
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. 设置 QEMU 以支持多架构构建
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      # 3. 设置 Docker Buildx
+      #    这是实现多架构构建的关键
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 4. 登录到 Docker Hub
+      #    需要 DOCKERHUB_USERNAME 和 DOCKERHUB_TOKEN 两个仓库秘密
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # 5. 登录到 GitHub Container Registry (GHCR)
+      #    使用自动生成的 GITHUB_TOKEN，无需手动创建秘密
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 6. 构建并推送多架构镜像
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          # 指定要构建的平台架构
+          platforms: linux/amd64,linux/arm64
+          # 推送到多个镜像仓库
+          push: true
+          # !! 关键: 定义两个仓库的标签 !!
+          # 1. GHCR 标签 (自动获取仓库名)
+          # 2. Docker Hub 标签 (!! 需要您手动修改 !!)
+          tags: |
+            ghcr.io/${{ github.repository }}:latest
+            maxduke/rsi6_monitor_bot:latest
+          # 使用 Docker 的构建缓存，加快后续构建速度
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+*.egg-info/
+dist/
+build/
+
+# 数据库文件
+*.db
+/data/
+
+# 环境变量文件 (非常重要!)
+.env
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store

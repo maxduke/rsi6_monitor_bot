@@ -1,0 +1,17 @@
+services:
+  rsi-bot:
+    # 方案1: 从 Dockerfile 本地构建 (用于开发)
+    build: .
+    
+    # 方案2: 从镜像仓库拉取预构建的多架构镜像 (用于生产)
+    # 使用时，请取消下面的注释，并注释掉上面的 "build: ."
+    # image: ghcr.io/maxduke/rsi6_monitor_bot:latest
+    
+    container_name: rsi_monitor_bot
+    restart: unless-stopped
+    # 加载包含环境变量的 .env 文件
+    env_file:
+      - .env
+    # 挂载卷，实现数据持久化
+    volumes:
+      - ./data:/app/data
