@@ -37,7 +37,7 @@ RANDOM_DELAY_MAX_SECONDS = float(os.getenv('RANDOM_DELAY_MAX_SECONDS', '0'))
 FETCH_FAILURE_THRESHOLD = int(os.getenv('FETCH_FAILURE_THRESHOLD', '5'))
 REQUEST_INTERVAL_SECONDS = float(os.getenv('REQUEST_INTERVAL_SECONDS', '1.0'))
 ENABLE_DAILY_BRIEFING = os.getenv('ENABLE_DAILY_BRIEFING', 'false').lower() == 'true'
-BRIEFING_TIME_STR = os.getenv('DAILY_BRIEFING_TIME', '20:30')
+BRIEFING_TIMES_STR = os.getenv('DAILY_BRIEFING_TIMES', '15:30')
 
 # --- 日志配置 ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -60,7 +60,6 @@ CHINA_CALENDAR = mcal.get_calendar('XSHG')
 
 # --- 数据库模块 ---
 def db_init():
-    """初始化数据库，如果文件不存在则创建，并创建必要的表。"""
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         cursor.execute('''
@@ -79,10 +78,7 @@ def db_init():
             cursor.execute('INSERT OR IGNORE INTO whitelist (user_id) VALUES (?)', (ADMIN_USER_ID,))
         conn.commit()
         logger.info("数据库初始化完成。")
-
-
 def db_execute(query, params=(), fetchone=False, fetchall=False):
-    """执行数据库查询的通用函数。"""
     try:
         with sqlite3.connect(DB_FILE) as conn:
             conn.row_factory = sqlite3.Row
@@ -127,7 +123,6 @@ def admin_only(func):
 
 # --- 数据获取与计算模块 ---
 async def get_asset_name_with_cache(asset_code: str, context: ContextTypes.DEFAULT_TYPE) -> str:
-    """优先从缓存获取资产名称，否则通过API获取并存入缓存。"""
     name_cache = context.bot_data.get(KEY_NAME_CACHE, {})
     if asset_code in name_cache:
         logger.debug(f"从缓存命中资产名称: {asset_code} -> {name_cache[asset_code]}")
@@ -151,10 +146,7 @@ async def get_asset_name_with_cache(asset_code: str, context: ContextTypes.DEFAU
         return name
     else:
         return f"未知资产({asset_code})"
-
-
 async def get_history_data(asset_code: str) -> Union[pd.DataFrame, None]:
-    """获取单个资产的历史日线数据。"""
     try:
         today = datetime.now()
         start_date = (today - timedelta(days=HIST_FETCH_DAYS)).strftime('%Y%m%d')
@@ -172,10 +164,7 @@ async def get_history_data(asset_code: str) -> Union[pd.DataFrame, None]:
     except Exception as e:
         logger.error(f"获取 {asset_code} 历史数据失败: {e}")
         return None
-
-
 def calculate_rsi_with_spot_price(hist_df: pd.DataFrame, spot_price: float) -> Union[float, None]:
-    """使用已获取的历史数据和实时价格计算RSI，正确处理当天数据。"""
     try:
         if hist_df is None or hist_df.empty: return None
         price_col = '收盘'
@@ -199,12 +188,8 @@ def calculate_rsi_with_spot_price(hist_df: pd.DataFrame, spot_price: float) -> U
 
 # --- 市场时间检查 ---
 def is_trading_day(check_date: datetime) -> bool:
-    """使用日历检查指定日期是否为交易日。"""
     return not CHINA_CALENDAR.valid_days(start_date=check_date.date(), end_date=check_date.date()).empty
-
-
 def is_market_hours() -> bool:
-    """检查当前是否为A股交易时间 (已包含节假日判断)。"""
     tz = pytz.timezone('Asia/Shanghai')
     now = datetime.now(tz)
     if not is_trading_day(now): return False
@@ -247,7 +232,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 <b>全局配置:</b>
 - RSI 周期: <b>{RSI_PERIOD}</b>
 - 请求间隔: <b>{REQUEST_INTERVAL_SECONDS}秒</b>
-- 每日简报主开关: <b>{'开启' if ENABLE_DAILY_BRIEFING else '关闭'} ({BRIEFING_TIME_STR})</b>
+- 每日简报主开关: <b>{'开启' if ENABLE_DAILY_BRIEFING else '关闭'} ({BRIEFING_TIMES_STR})</b>
     """
     await update.message.reply_html(help_text)
 
@@ -659,8 +644,6 @@ async def post_init(application: Application):
         logger.info(f"从数据库预加载了 {len(name_cache)} 个资产名称到缓存。")
     bot_data[KEY_NAME_CACHE] = name_cache
     logger.info("Bot application data 初始化完成。")
-
-
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """记录所有未被捕获的异常。"""
     logger.error(f"未捕获的异常: {context.error}", exc_info=False)
@@ -682,7 +665,7 @@ def main():
     logger.info(f"请求间隔: {REQUEST_INTERVAL_SECONDS}秒")
     logger.info(f"每日简报主开关: {'开启' if ENABLE_DAILY_BRIEFING else '关闭'}")
     if ENABLE_DAILY_BRIEFING:
-        logger.info(f"每日简报发送时间: {BRIEFING_TIME_STR} (上海时间)")
+        logger.info(f"每日简报发送时间: {BRIEFING_TIMES_STR} (上海时间)")
     logger.info("--------------------")
     db_init()
     application = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
@@ -705,14 +688,20 @@ def main():
     job_queue = application.job_queue
     job_queue.run_repeating(check_rules_job, interval=CHECK_INTERVAL_SECONDS, first=10)
     if ENABLE_DAILY_BRIEFING:
-        try:
-            hour, minute = map(int, BRIEFING_TIME_STR.split(':'))
-            tz_shanghai = pytz.timezone('Asia/Shanghai')
-            briefing_time = time(hour, minute, tzinfo=tz_shanghai)
-            job_queue.run_daily(daily_briefing_job, time=briefing_time, name="daily_briefing")
-            logger.info(f"已成功注册每日简报任务，将于每天 {BRIEFING_TIME_STR} (上海时间) 执行。")
-        except (ValueError, IndexError):
-            logger.error(f"每日简报时间格式错误 ('{BRIEFING_TIME_STR}')，应为 HH:MM 格式。每日简报功能未开启。")
+        briefing_times = [t.strip() for t in BRIEFING_TIMES_STR.split(',') if t.strip()]
+        successful_times = []
+        for time_str in briefing_times:
+            try:
+                hour, minute = map(int, time_str.split(':'))
+                tz_shanghai = pytz.timezone('Asia/Shanghai')
+                briefing_time = time(hour, minute, tzinfo=tz_shanghai)
+                job_queue.run_daily(daily_briefing_job, time=briefing_time, name=f"daily_briefing_{time_str}")
+                successful_times.append(time_str)
+            except (ValueError, IndexError):
+                logger.error(f"每日简报时间格式错误 ('{time_str}')，应为 HH:MM 格式。该时间点的任务未开启。")
+        if successful_times:
+            logger.info(f"已成功注册每日简报任务，将于每天 {', '.join(successful_times)} (上海时间) 执行。")
+
     logger.info("机器人正在启动...")
     application.run_polling()
 
