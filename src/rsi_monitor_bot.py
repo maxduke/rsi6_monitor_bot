@@ -9,7 +9,7 @@ from datetime import datetime, time, timedelta
 import pytz
 import asyncio
 from functools import wraps
-from typing import Union, Dict
+from typing import Union, Dict, List, Tuple
 import os
 import random
 import pandas_market_calendars as mcal
@@ -18,7 +18,7 @@ from collections import defaultdict
 from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
-from telegram.error import Forbidden, NetworkError
+from telegram.error import Forbidden
 
 # --- 机器人配置 (从环境变量读取) ---
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
@@ -41,9 +41,8 @@ BRIEFING_TIMES_STR = os.getenv('DAILY_BRIEFING_TIMES', '15:30')
 
 # --- 日志配置 ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram.ext").setLevel(logging.WARNING)
-logging.getLogger("apscheduler").setLevel(logging.WARNING)
+for logger_name in ["httpx", "telegram.ext", "apscheduler"]:
+    logging.getLogger(logger_name).setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # --- 应用内常量 ---
@@ -92,15 +91,11 @@ def db_execute(query, params=(), fetchone=False, fetchall=False):
         logger.error(f"数据库操作失败: {e}")
         return None
 
-
-# --- 白名单管理 ---
+# --- 白名单与装饰器 ---
 def is_whitelisted(user_id: int) -> bool: return db_execute("SELECT 1 FROM whitelist WHERE user_id = ?", (user_id,), fetchone=True) is not None
 def add_to_whitelist(user_id: int): db_execute("INSERT OR IGNORE INTO whitelist (user_id) VALUES (?)", (user_id,))
 def remove_from_whitelist(user_id: int): db_execute("DELETE FROM whitelist WHERE user_id = ?", (user_id,))
 def get_whitelist(): return db_execute("SELECT * FROM whitelist", fetchall=True)
-
-
-# --- 装饰器 ---
 def whitelisted_only(func):
     @wraps(func)
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
@@ -109,8 +104,6 @@ def whitelisted_only(func):
             return
         return await func(update, context, *args, **kwargs)
     return wrapped
-
-
 def admin_only(func):
     @wraps(func)
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
@@ -119,7 +112,6 @@ def admin_only(func):
             return
         return await func(update, context, *args, **kwargs)
     return wrapped
-
 
 # --- 数据获取与计算模块 ---
 async def get_asset_name_with_cache(asset_code: str, context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -144,19 +136,19 @@ async def get_asset_name_with_cache(asset_code: str, context: ContextTypes.DEFAU
         name_cache[asset_code] = name
         logger.debug(f"已将新资产名称存入缓存: {asset_code} -> {name}")
         return name
-    else:
-        return f"未知资产({asset_code})"
-async def get_history_data(asset_code: str) -> Union[pd.DataFrame, None]:
+    return f"未知资产({asset_code})"
+
+async def get_history_data(asset_code: str, days: int) -> Union[pd.DataFrame, None]:
+    """获取单个资产的历史日线数据。"""
     try:
         today = datetime.now()
-        start_date = (today - timedelta(days=HIST_FETCH_DAYS)).strftime('%Y%m%d')
+        start_date = (today - timedelta(days=days)).strftime('%Y%m%d')
         end_date = today.strftime('%Y%m%d')
         if asset_code.startswith(STOCK_PREFIXES):
             df = await asyncio.to_thread(ak.stock_zh_a_hist, symbol=asset_code, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
         elif asset_code.startswith(ETF_PREFIXES):
             df = await asyncio.to_thread(ak.fund_etf_hist_em, symbol=asset_code, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
-        else:
-            return None
+        else: return None
         if df is not None and not df.empty:
             df['日期'] = pd.to_datetime(df['日期'])
             df.set_index('日期', inplace=True)
@@ -164,26 +156,77 @@ async def get_history_data(asset_code: str) -> Union[pd.DataFrame, None]:
     except Exception as e:
         logger.error(f"获取 {asset_code} 历史数据失败: {e}")
         return None
-def calculate_rsi_with_spot_price(hist_df: pd.DataFrame, spot_price: float) -> Union[float, None]:
+
+def calculate_rsi(close_prices: pd.Series) -> Union[float, None]:
+    """从价格序列计算RSI。"""
     try:
-        if hist_df is None or hist_df.empty: return None
-        price_col = '收盘'
-        if price_col not in hist_df.columns: return None
-        close_prices = hist_df[price_col].copy()
-        last_date_in_hist = close_prices.index[-1].date()
-        today_date = datetime.now(pytz.timezone('Asia/Shanghai')).date()
-        if last_date_in_hist < today_date:
-            today_timestamp = pd.Timestamp(today_date)
-            new_row_series = pd.Series([spot_price], index=[today_timestamp])
-            close_prices = pd.concat([close_prices, new_row_series])
-        else:
-            close_prices.iloc[-1] = float(spot_price)
         rsi = ta.rsi(close_prices, length=RSI_PERIOD, mamode="wilder")
         if rsi is None or rsi.empty: return None
         return round(rsi.iloc[-1], 2)
     except Exception as e:
-        logger.error(f"从预加载数据计算RSI时出错: {e}")
+        logger.error(f"计算RSI时出错: {e}")
         return None
+
+def get_prices_for_rsi(hist_df: pd.DataFrame, spot_price: float) -> Union[pd.Series, None]:
+    """根据历史和实时价格准备用于RSI计算的价格序列。"""
+    if hist_df is None or hist_df.empty: return None
+    if '收盘' not in hist_df.columns: return None
+    close_prices = hist_df['收盘'].copy()
+    last_date_in_hist = close_prices.index[-1].date()
+    today_date = datetime.now(pytz.timezone('Asia/Shanghai')).date()
+    # 关键逻辑：确保最后一行是当前的 spot_price
+    if last_date_in_hist < today_date:
+        close_prices.loc[pd.Timestamp(today_date)] = spot_price
+    else:
+        close_prices.iloc[-1] = float(spot_price)
+    return close_prices
+
+
+async def _fetch_all_spot_data(context: ContextTypes.DEFAULT_TYPE, codes: List[str], price_key: str = '最新价') -> Tuple[Dict, bool]:
+    """按需获取所有需要的实时行情数据并处理失败。"""
+    bot_data = context.bot_data
+    has_stocks = any(c.startswith(STOCK_PREFIXES) for c in codes)
+    has_etfs = any(c.startswith(ETF_PREFIXES) for c in codes)
+    stock_spot_df, etf_spot_df = pd.DataFrame(), pd.DataFrame()
+    try:
+        if has_stocks:
+            logger.info("监控列表中包含股票，获取A股实时行情...")
+            stock_spot_df = await asyncio.to_thread(ak.stock_zh_a_spot_em)
+            if has_etfs:
+                logger.debug(f"应用请求间隔: {REQUEST_INTERVAL_SECONDS}秒")
+                await asyncio.sleep(REQUEST_INTERVAL_SECONDS)
+        if has_etfs:
+            logger.info("监控列表中包含ETF，获取ETF实时行情...")
+            etf_spot_df = await asyncio.to_thread(ak.fund_etf_spot_em)
+        
+        if bot_data.get(KEY_FAILURE_COUNT, 0) > 0: logger.info("数据获取成功，重置失败计数器。")
+        bot_data[KEY_FAILURE_COUNT] = 0
+        bot_data[KEY_FAILURE_SENT] = False
+
+        all_spot_df = pd.concat([stock_spot_df, etf_spot_df])
+        if all_spot_df.empty:
+            logger.warning("未能获取到任何有效的实时行情数据。")
+            return {}, True
+        
+        all_spot_df.set_index('代码', inplace=True)
+        # 每日简报需要 '收盘' 价，如果不存在则用 '最新价'
+        final_price_key = '收盘' if price_key == '收盘' and '收盘' in all_spot_df.columns else '最新价'
+        return all_spot_df[final_price_key].to_dict(), True
+
+    except Exception as e:
+        bot_data[KEY_FAILURE_COUNT] = bot_data.get(KEY_FAILURE_COUNT, 0) + 1
+        count = bot_data[KEY_FAILURE_COUNT]
+        logger.error(f"获取实时行情失败 (连续第 {count} 次): {e}")
+        if count >= FETCH_FAILURE_THRESHOLD and not bot_data.get(KEY_FAILURE_SENT) and ADMIN_USER_ID:
+            admin_message = (f"🚨 **机器人警报** 🚨\n\n数据获取连续失败已达到 **{count}** 次，超过阈值 ({FETCH_FAILURE_THRESHOLD})。\n\n"
+                             f"请检查机器人日志和网络连接。\n\n最后一次错误: `{e}`")
+            try:
+                await context.bot.send_message(chat_id=ADMIN_USER_ID, text=admin_message, parse_mode=ParseMode.MARKDOWN)
+                logger.warning(f"已向管理员发送数据获取失败的警报通知。")
+                bot_data[KEY_FAILURE_SENT] = True
+            except Exception as notify_e:
+                logger.error(f"发送失败警报给管理员时出错: {notify_e}")
+        return {}, False
 
 
 # --- 市场时间检查 ---
@@ -203,7 +246,6 @@ def is_market_hours() -> bool:
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update.message.reply_html(f"你好, {user.mention_html()}!\n\n这是一个A股/ETF的RSI({RSI_PERIOD})监控机器人。\n使用 /help 查看所有可用命令。")
-
 
 @whitelisted_only
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -245,41 +287,45 @@ async def check_rsi_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("您没有任何已激活的监控规则。")
         return
     sent_message = await update.message.reply_text("正在查询您规则中所有资产的最新RSI值，请稍候...")
+    
     rules_by_code = defaultdict(list)
-    for rule in rules:
-        rules_by_code[rule['asset_code']].append(rule)
+    for rule in rules: rules_by_code[rule['asset_code']].append(rule)
     unique_codes = sorted(list(rules_by_code.keys()))
-    has_stocks = any(c.startswith(STOCK_PREFIXES) for c in unique_codes)
-    has_etfs = any(c.startswith(ETF_PREFIXES) for c in unique_codes)
+    
     rsi_results = {}
     try:
-        stock_spot_df, etf_spot_df = pd.DataFrame(), pd.DataFrame()
-        if has_stocks:
-            stock_spot_df = await asyncio.to_thread(ak.stock_zh_a_spot_em)
-            if has_etfs: await asyncio.sleep(REQUEST_INTERVAL_SECONDS)
-        if has_etfs:
-            etf_spot_df = await asyncio.to_thread(ak.fund_etf_spot_em)
-        all_spot_df = pd.concat([stock_spot_df, etf_spot_df])
-        spot_data = {}
-        if not all_spot_df.empty:
-            all_spot_df.set_index('代码', inplace=True)
-            spot_data = all_spot_df['最新价'].to_dict()
+        # 使用辅助函数获取实时价格
+        spot_data, success = await _fetch_all_spot_data(context, unique_codes)
+        if not success:
+            await sent_message.edit_text("获取实时价格失败，请稍后重试。")
+            return
+
         for code in unique_codes:
             spot_price = spot_data.get(code)
             if spot_price is None or pd.isna(spot_price):
                 rsi_results[code] = "获取价格失败"
                 continue
-            await asyncio.sleep(REQUEST_INTERVAL_SECONDS)
-            hist_df = await get_history_data(code)
+            
+            # 优先使用缓存，如果不存在则单独获取
+            hist_df = context.bot_data.get(KEY_HIST_CACHE, {}).get(code)
+            if hist_df is None:
+                logger.info(f"/check: 缓存未命中，为 {code} 单独获取历史数据。")
+                await asyncio.sleep(REQUEST_INTERVAL_SECONDS)
+                hist_df = await get_history_data(code, HIST_FETCH_DAYS)
+            
             if hist_df is None:
                 rsi_results[code] = "获取历史失败"
                 continue
-            rsi_value = calculate_rsi_with_spot_price(hist_df, spot_price)
+
+            prices = get_prices_for_rsi(hist_df, spot_price)
+            rsi_value = calculate_rsi(prices) if prices is not None else None
             rsi_results[code] = f"{rsi_value:.2f}" if isinstance(rsi_value, float) else "计算失败"
+            
     except Exception as e:
         logger.error(f"执行 /check 命令时出错: {e}")
-        await sent_message.edit_text("查询时发生错误，请稍后重试。")
+        await sent_message.edit_text("查询时发生内部错误，请稍后重试。")
         return
+
     message = "<b>📈 最新RSI值查询结果:</b>\n\n"
     for code, code_rules in rules_by_code.items():
         asset_name = code_rules[0]['asset_name']
@@ -309,8 +355,6 @@ async def briefing_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ 已为您关闭每日收盘简报功能。")
     else:
         await update.message.reply_text("指令格式错误。请使用 /briefing on 或 /briefing off。")
-
-
 @whitelisted_only
 async def add_rule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -342,8 +386,6 @@ async def add_rule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         error_message = "添加规则时发生内部错误。"
         if sent_message: await sent_message.edit_text(error_message)
         else: await update.message.reply_text(error_message)
-
-
 @whitelisted_only
 async def list_rules_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -366,8 +408,6 @@ async def list_rules_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         logger.error(f"列出规则时出错: {e}")
         await update.message.reply_text("获取规则列表时发生错误。")
-
-
 @whitelisted_only
 async def delete_rule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -385,8 +425,6 @@ async def delete_rule_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as e:
         logger.error(f"删除规则时出错: {e}")
         await update.message.reply_text("删除规则时发生错误。")
-
-
 @whitelisted_only
 async def toggle_rule_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -406,8 +444,6 @@ async def toggle_rule_status_command(update: Update, context: ContextTypes.DEFAU
     except Exception as e:
         logger.error(f"切换规则状态时出错: {e}")
         await update.message.reply_text("切换规则状态时发生错误。")
-
-
 @admin_only
 async def add_whitelist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -415,8 +451,6 @@ async def add_whitelist_command(update: Update, context: ContextTypes.DEFAULT_TY
         add_to_whitelist(user_id_to_add)
         await update.message.reply_text(f"✅ 用户 {user_id_to_add} 已添加到白名单。")
     except (ValueError, IndexError): await update.message.reply_text("命令格式错误。\n正确格式: /add_w <user_id>")
-
-
 @admin_only
 async def del_whitelist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -427,8 +461,6 @@ async def del_whitelist_command(update: Update, context: ContextTypes.DEFAULT_TY
         remove_from_whitelist(user_id_to_del)
         await update.message.reply_text(f"✅ 用户 {user_id_to_del} 已从白名单中移除。")
     except (ValueError, IndexError): await update.message.reply_text("命令格式错误。\n正确格式: /del_w <user_id>")
-
-
 @admin_only
 async def list_whitelist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = db_execute("SELECT * FROM whitelist", fetchall=True)
@@ -448,72 +480,49 @@ async def check_rules_job(context: ContextTypes.DEFAULT_TYPE):
         delay = random.uniform(0, RANDOM_DELAY_MAX_SECONDS)
         logger.info(f"应用启动延迟: {delay:.2f}秒")
         await asyncio.sleep(delay)
+    
     logger.info("交易时间，开始执行规则检查...")
     active_rules = db_execute("SELECT * FROM rules WHERE is_active = 1", fetchall=True)
     if not active_rules: return
+
     bot_data = context.bot_data
     all_codes = {rule['asset_code'] for rule in active_rules}
-    has_stocks = any(c.startswith(STOCK_PREFIXES) for c in all_codes)
-    has_etfs = any(c.startswith(ETF_PREFIXES) for c in all_codes)
+    
     today_str = datetime.now(pytz.timezone('Asia/Shanghai')).strftime('%Y-%m-%d')
     if bot_data.get(KEY_CACHE_DATE) != today_str:
         logger.info(f"日期变更或首次运行，清空并重建 {today_str} 的历史数据缓存。")
         bot_data[KEY_HIST_CACHE] = {}
         bot_data[KEY_CACHE_DATE] = today_str
+    
     hist_data_cache = bot_data.get(KEY_HIST_CACHE, {})
     codes_to_fetch_hist = [code for code in all_codes if code not in hist_data_cache]
+    
     if codes_to_fetch_hist:
         logger.info(f"需要为 {len(codes_to_fetch_hist)} 个新资产顺序获取历史数据...")
         for code in codes_to_fetch_hist:
             logger.debug(f"正在获取 {code} 的历史数据...")
-            data = await get_history_data(code)
+            data = await get_history_data(code, HIST_FETCH_DAYS)
             hist_data_cache[code] = data
             logger.debug(f"应用请求间隔: {REQUEST_INTERVAL_SECONDS}秒")
             await asyncio.sleep(REQUEST_INTERVAL_SECONDS)
-    stock_spot_df, etf_spot_df = pd.DataFrame(), pd.DataFrame()
-    try:
-        if has_stocks:
-            logger.info("监控列表中包含股票，获取A股实时行情...")
-            stock_spot_df = await asyncio.to_thread(ak.stock_zh_a_spot_em)
-            if has_etfs:
-                logger.debug(f"应用请求间隔: {REQUEST_INTERVAL_SECONDS}秒")
-                await asyncio.sleep(REQUEST_INTERVAL_SECONDS)
-        if has_etfs:
-            logger.info("监控列表中包含ETF，获取ETF实时行情...")
-            etf_spot_df = await asyncio.to_thread(ak.fund_etf_spot_em)
-        if bot_data.get(KEY_FAILURE_COUNT, 0) > 0: logger.info("数据获取成功，重置失败计数器。")
-        bot_data[KEY_FAILURE_COUNT] = 0
-        bot_data[KEY_FAILURE_SENT] = False
-    except Exception as e:
-        bot_data[KEY_FAILURE_COUNT] = bot_data.get(KEY_FAILURE_COUNT, 0) + 1
-        count = bot_data[KEY_FAILURE_COUNT]
-        logger.error(f"检查任务中获取实时行情失败 (连续第 {count} 次): {e}")
-        if count >= FETCH_FAILURE_THRESHOLD and not bot_data.get(KEY_FAILURE_SENT):
-            admin_message = (f"🚨 **机器人警报** 🚨\n\n数据获取连续失败已达到 **{count}** 次，超过阈值 ({FETCH_FAILURE_THRESHOLD})。\n\n"
-                             f"请检查机器人日志和网络连接。\n\n最后一次错误: `{e}`")
-            try:
-                await context.bot.send_message(chat_id=ADMIN_USER_ID, text=admin_message, parse_mode=ParseMode.MARKDOWN)
-                logger.warning(f"已向管理员发送数据获取失败的警报通知。")
-                bot_data[KEY_FAILURE_SENT] = True
-            except Exception as notify_e:
-                logger.error(f"发送失败警报给管理员时出错: {notify_e}")
-        return
-    all_spot_df = pd.concat([stock_spot_df, etf_spot_df])
-    if all_spot_df.empty:
-        logger.warning("未能获取到任何有效的实时行情数据。")
-        return
-    all_spot_df.set_index('代码', inplace=True)
-    spot_data = all_spot_df['最新价'].to_dict()
+
+    spot_data, success = await _fetch_all_spot_data(context, list(all_codes))
+    if not success: return
+
     for rule in active_rules:
         asset_code = rule['asset_code']
         hist_df = hist_data_cache.get(asset_code)
         spot_price = spot_data.get(asset_code)
         if hist_df is None or spot_price is None or pd.isna(spot_price): continue
-        current_rsi = calculate_rsi_with_spot_price(hist_df, spot_price)
+        
+        prices = get_prices_for_rsi(hist_df, spot_price)
+        current_rsi = calculate_rsi(prices) if prices is not None else None
         if current_rsi is None: continue
+
         logger.debug(f"检查: {rule['asset_name']}({asset_code}) | RSI({RSI_PERIOD}): {current_rsi}")
         is_triggered = rule['rsi_min'] <= current_rsi <= rule['rsi_max']
         last_notified_rsi_in_range = rule['rsi_min'] <= rule['last_notified_rsi'] <= rule['rsi_max']
+        
         if is_triggered and rule['notification_count'] < MAX_NOTIFICATIONS_PER_TRIGGER:
             message = (f"🎯 <b>RSI 警报 ({rule['notification_count'] + 1}/{MAX_NOTIFICATIONS_PER_TRIGGER})</b> 🎯\n\n"
                        f"<b>{rule['asset_name']} ({rule['asset_code']})</b>\n\n"
@@ -530,67 +539,57 @@ async def check_rules_job(context: ContextTypes.DEFAULT_TYPE):
         elif is_triggered:
             db_execute("UPDATE rules SET last_notified_rsi = ? WHERE id = ?", (current_rsi, rule['id']))
 
-
 async def daily_briefing_job(context: ContextTypes.DEFAULT_TYPE):
-    if not ENABLE_DAILY_BRIEFING:
-        logger.debug("每日简报主开关为关闭状态，跳过任务。")
-        return
+    if not ENABLE_DAILY_BRIEFING: return
     tz = pytz.timezone('Asia/Shanghai')
     now = datetime.now(tz)
     if not is_trading_day(now):
         logger.info(f"今天 ({now.strftime('%Y-%m-%d')}) 非交易日，跳过每日简报。")
         return
+    
     logger.info("开始执行每日收盘RSI简报任务...")
     enabled_users_rows = db_execute("SELECT user_id FROM whitelist WHERE daily_briefing_enabled = 1", fetchall=True)
-    if not enabled_users_rows:
-        logger.info("没有用户开启每日简报，无需发送。")
-        return
+    if not enabled_users_rows: return
+    
     enabled_user_ids = {row['user_id'] for row in enabled_users_rows}
     all_briefing_rules = db_execute("SELECT * FROM rules WHERE is_active = 1 AND user_id IN ({})".format(','.join('?' for _ in enabled_user_ids)), tuple(enabled_user_ids), fetchall=True)
-    if not all_briefing_rules:
-        logger.info("开启了简报的用户没有任何激活的规则，无需发送。")
-        return
-    rules_by_user = defaultdict(list)
-    for rule in all_briefing_rules:
-        rules_by_user[rule['user_id']].append(rule)
+    if not all_briefing_rules: return
+
     all_unique_codes = sorted(list({rule['asset_code'] for rule in all_briefing_rules}))
-    has_stocks = any(c.startswith(STOCK_PREFIXES) for c in all_unique_codes)
-    has_etfs = any(c.startswith(ETF_PREFIXES) for c in all_unique_codes)
-    rsi_results: Dict[str, Union[str, float]] = {}
-    try:
-        stock_spot_df, etf_spot_df = pd.DataFrame(), pd.DataFrame()
-        if has_stocks:
-            stock_spot_df = await asyncio.to_thread(ak.stock_zh_a_spot_em)
-            if has_etfs: await asyncio.sleep(REQUEST_INTERVAL_SECONDS)
-        if has_etfs:
-            etf_spot_df = await asyncio.to_thread(ak.fund_etf_spot_em)
-        all_spot_df = pd.concat([stock_spot_df, etf_spot_df])
-        spot_data = {}
-        if not all_spot_df.empty:
-            all_spot_df.set_index('代码', inplace=True)
-            spot_data = all_spot_df.get('收盘', all_spot_df['最新价']).to_dict()
-        for code in all_unique_codes:
-            spot_price = spot_data.get(code)
-            if spot_price is None or pd.isna(spot_price):
-                rsi_results[code] = "N/A"
-                continue
-            await asyncio.sleep(REQUEST_INTERVAL_SECONDS)
-            hist_df = await get_history_data(code)
-            if hist_df is None:
-                rsi_results[code] = "N/A"
-                continue
-            rsi_value = calculate_rsi_with_spot_price(hist_df, spot_price)
-            rsi_results[code] = rsi_value if isinstance(rsi_value, float) else "N/A"
-    except Exception as e:
-        logger.error(f"执行每日简报任务时获取数据失败: {e}")
+    
+
+    spot_data, success = await _fetch_all_spot_data(context, all_unique_codes, price_key='收盘')
+    if not success:
+        logger.error("执行每日简报任务时获取数据失败，任务中止。")
         return
+
+    rsi_results: Dict[str, Union[str, float]] = {}
+    for code in all_unique_codes:
+        spot_price = spot_data.get(code)
+        if spot_price is None or pd.isna(spot_price):
+            rsi_results[code] = "N/A"
+            continue
+        
+        await asyncio.sleep(REQUEST_INTERVAL_SECONDS)
+        hist_df = await get_history_data(code, HIST_FETCH_DAYS)
+        if hist_df is None:
+            rsi_results[code] = "N/A"
+            continue
+        
+        # 对于简报，我们直接使用获取到的历史数据+收盘价进行计算
+        prices = get_prices_for_rsi(hist_df, spot_price)
+        rsi_value = calculate_rsi(prices) if prices is not None else "N/A"
+        rsi_results[code] = rsi_value
+
     today_str_display = now.strftime('%Y年%m月%d日')
+    rules_by_user = defaultdict(list)
+    for rule in all_briefing_rules: rules_by_user[rule['user_id']].append(rule)
+        
     for user_id, user_rules in rules_by_user.items():
-        if not user_rules: continue
-        user_rules_by_code = defaultdict(list)
-        for rule in user_rules:
-            user_rules_by_code[rule['asset_code']].append(rule)
         message = f"📰 <b>收盘RSI简报 ({today_str_display})</b>\n\n"
+        user_rules_by_code = defaultdict(list)
+        for rule in user_rules: user_rules_by_code[rule['asset_code']].append(rule)
+        
         for code, code_rules in sorted(user_rules_by_code.items()):
             asset_name = code_rules[0]['asset_name']
             rsi_val = rsi_results.get(code)
@@ -599,12 +598,10 @@ async def daily_briefing_job(context: ContextTypes.DEFAULT_TYPE):
                 icon = "🎯" if is_triggered else "▪️"
                 rsi_str = f"<b>{rsi_val:.2f}</b>"
             else:
-                icon = "❓"
-                rsi_str = "查询失败"
+                icon = "❓"; rsi_str = "查询失败"
             message += f"{icon} <b>{asset_name}</b> (<code>{code}</code>)\n"
             message += f"  - 收盘 RSI({RSI_PERIOD}): {rsi_str}\n"
-            for rule in code_rules:
-                message += f"  - 监控区间: {rule['rsi_min']} - {rule['rsi_max']}\n"
+            for rule in code_rules: message += f"  - 监控区间: {rule['rsi_min']} - {rule['rsi_max']}\n"
             message += "\n"
         try:
             await context.bot.send_message(chat_id=user_id, text=message, parse_mode=ParseMode.HTML)
@@ -619,14 +616,10 @@ async def daily_briefing_job(context: ContextTypes.DEFAULT_TYPE):
 async def post_init(application: Application):
     """在机器人启动后设置自定义命令并初始化bot_data。"""
     commands = [
-        BotCommand("start", "开始使用机器人"),
-        BotCommand("help", "获取帮助信息"),
-        BotCommand("check", "立即查询当前RSI"),
-        BotCommand("briefing", "开关每日简报"),
-        BotCommand("add", "添加监控: CODE min max"),
-        BotCommand("del", "删除监控: ID"),
-        BotCommand("list", "查看我的监控"),
-        BotCommand("on", "开启监控: ID"),
+        BotCommand("start", "开始使用机器人"), BotCommand("help", "获取帮助信息"),
+        BotCommand("check", "立即查询当前RSI"), BotCommand("briefing", "开关每日简报"),
+        BotCommand("add", "添加监控: CODE min max"), BotCommand("del", "删除监控: ID"),
+        BotCommand("list", "查看我的监控"), BotCommand("on", "开启监控: ID"),
         BotCommand("off", "关闭监控: ID"),
     ]
     await application.bot.set_my_commands(commands)
@@ -635,6 +628,7 @@ async def post_init(application: Application):
     bot_data[KEY_CACHE_DATE] = None
     bot_data[KEY_FAILURE_COUNT] = 0
     bot_data[KEY_FAILURE_SENT] = False
+    
     name_cache = {}
     all_rules = db_execute("SELECT asset_code, asset_name FROM rules", fetchall=True)
     if all_rules:
@@ -644,10 +638,10 @@ async def post_init(application: Application):
         logger.info(f"从数据库预加载了 {len(name_cache)} 个资产名称到缓存。")
     bot_data[KEY_NAME_CACHE] = name_cache
     logger.info("Bot application data 初始化完成。")
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """记录所有未被捕获的异常。"""
     logger.error(f"未捕获的异常: {context.error}", exc_info=False)
-
 
 def main():
     """主函数，用于启动机器人。"""
@@ -671,18 +665,12 @@ def main():
     application = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     application.add_error_handler(error_handler)
     handlers = [
-        CommandHandler("start", start_command),
-        CommandHandler("help", help_command),
-        CommandHandler("check", check_rsi_command),
-        CommandHandler("briefing", briefing_command),
-        CommandHandler("add", add_rule_command),
-        CommandHandler("list", list_rules_command),
-        CommandHandler("del", delete_rule_command),
-        CommandHandler("on", toggle_rule_status_command),
-        CommandHandler("off", toggle_rule_status_command),
-        CommandHandler("add_w", add_whitelist_command),
-        CommandHandler("del_w", del_whitelist_command),
-        CommandHandler("list_w", list_whitelist_command)
+        CommandHandler("start", start_command), CommandHandler("help", help_command),
+        CommandHandler("check", check_rsi_command), CommandHandler("briefing", briefing_command),
+        CommandHandler("add", add_rule_command), CommandHandler("list", list_rules_command),
+        CommandHandler("del", delete_rule_command), CommandHandler("on", toggle_rule_status_command),
+        CommandHandler("off", toggle_rule_status_command), CommandHandler("add_w", add_whitelist_command),
+        CommandHandler("del_w", del_whitelist_command), CommandHandler("list_w", list_whitelist_command)
     ]
     application.add_handlers(handlers)
     job_queue = application.job_queue
@@ -701,10 +689,8 @@ def main():
                 logger.error(f"每日简报时间格式错误 ('{time_str}')，应为 HH:MM 格式。该时间点的任务未开启。")
         if successful_times:
             logger.info(f"已成功注册每日简报任务，将于每天 {', '.join(successful_times)} (上海时间) 执行。")
-
     logger.info("机器人正在启动...")
     application.run_polling()
-
 
 if __name__ == '__main__':
     main()
