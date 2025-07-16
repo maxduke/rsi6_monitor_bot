@@ -60,7 +60,9 @@
 | `REQUEST_INTERVAL_SECONDS` | 每个API请求之间的固定间隔时间（秒），用于防止接口限制。     | `1.0`      |
 | `FETCH_FAILURE_THRESHOLD`  | 连续获取数据失败多少次后，向管理员发送一条警报通知。         | `5`        |
 | `ENABLE_DAILY_BRIEFING`    | **每日简报的主开关**。设为 `true` 以允许用户使用此功能。     | `false`    |
-| `DAILY_BRIEFING_TIME`      | 每日简报的发送时间 (上海时间, 24小时制)。                    | `20:30`    |
+| `DAILY_BRIEFING_TIMES`      | 每日简报的发送时间 (上海时间, 24小时制)。支持多个，用逗号分隔。     | `12：30，15:30`    |
+| `FETCH_RETRY_ATTEMPTS` | 获取数据失败后的重试次数。     | `3`      |
+| `FETCH_RETRY_DELAY_SECONDS`  | 每次重试之间的等待时间（秒）。         | `10`        |
 
 ## 🚀 部署与运行
 

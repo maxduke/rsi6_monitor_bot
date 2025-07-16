@@ -38,6 +38,8 @@ FETCH_FAILURE_THRESHOLD = int(os.getenv('FETCH_FAILURE_THRESHOLD', '5'))
 REQUEST_INTERVAL_SECONDS = float(os.getenv('REQUEST_INTERVAL_SECONDS', '1.0'))
 ENABLE_DAILY_BRIEFING = os.getenv('ENABLE_DAILY_BRIEFING', 'false').lower() == 'true'
 BRIEFING_TIMES_STR = os.getenv('DAILY_BRIEFING_TIMES', '15:30')
+FETCH_RETRY_ATTEMPTS = int(os.getenv('FETCH_RETRY_ATTEMPTS', '3'))
+FETCH_RETRY_DELAY_SECONDS = int(os.getenv('FETCH_RETRY_DELAY_SECONDS', '10'))
 
 # --- 日志配置 ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -183,50 +185,56 @@ def get_prices_for_rsi(hist_df: pd.DataFrame, spot_price: float) -> Union[pd.Ser
 
 
 async def _fetch_all_spot_data(context: ContextTypes.DEFAULT_TYPE, codes: List[str], price_key: str = '最新价') -> Tuple[Dict, bool]:
-    """按需获取所有需要的实时行情数据并处理失败。"""
-    bot_data = context.bot_data
+    """按需获取所有需要的实时行情数据，并在失败时重试。"""
     has_stocks = any(c.startswith(STOCK_PREFIXES) for c in codes)
     has_etfs = any(c.startswith(ETF_PREFIXES) for c in codes)
-    stock_spot_df, etf_spot_df = pd.DataFrame(), pd.DataFrame()
-    try:
-        if has_stocks:
-            logger.info("监控列表中包含股票，获取A股实时行情...")
-            stock_spot_df = await asyncio.to_thread(ak.stock_zh_a_spot_em)
+    
+    for attempt in range(FETCH_RETRY_ATTEMPTS):
+        try:
+            stock_spot_df, etf_spot_df = pd.DataFrame(), pd.DataFrame()
+            if has_stocks:
+                logger.info("获取A股实时行情...")
+                stock_spot_df = await asyncio.to_thread(ak.stock_zh_a_spot_em)
+                if has_etfs:
+                    await asyncio.sleep(REQUEST_INTERVAL_SECONDS)
             if has_etfs:
-                logger.debug(f"应用请求间隔: {REQUEST_INTERVAL_SECONDS}秒")
-                await asyncio.sleep(REQUEST_INTERVAL_SECONDS)
-        if has_etfs:
-            logger.info("监控列表中包含ETF，获取ETF实时行情...")
-            etf_spot_df = await asyncio.to_thread(ak.fund_etf_spot_em)
-        
-        if bot_data.get(KEY_FAILURE_COUNT, 0) > 0: logger.info("数据获取成功，重置失败计数器。")
-        bot_data[KEY_FAILURE_COUNT] = 0
-        bot_data[KEY_FAILURE_SENT] = False
+                logger.info("获取ETF实时行情...")
+                etf_spot_df = await asyncio.to_thread(ak.fund_etf_spot_em)
+            
+            # 成功获取，重置失败计数器并返回数据
+            if context.bot_data.get(KEY_FAILURE_COUNT, 0) > 0: logger.info("数据获取成功，重置失败计数器。")
+            context.bot_data[KEY_FAILURE_COUNT] = 0
+            context.bot_data[KEY_FAILURE_SENT] = False
 
-        all_spot_df = pd.concat([stock_spot_df, etf_spot_df])
-        if all_spot_df.empty:
-            logger.warning("未能获取到任何有效的实时行情数据。")
-            return {}, True
-        
-        all_spot_df.set_index('代码', inplace=True)
-        # 每日简报需要 '收盘' 价，如果不存在则用 '最新价'
-        final_price_key = '收盘' if price_key == '收盘' and '收盘' in all_spot_df.columns else '最新价'
-        return all_spot_df[final_price_key].to_dict(), True
+            all_spot_df = pd.concat([stock_spot_df, etf_spot_df])
+            if all_spot_df.empty:
+                logger.warning("行情接口返回数据为空。")
+                return {}, True
+            
+            all_spot_df.set_index('代码', inplace=True)
+            final_price_key = '收盘' if price_key == '收盘' and '收盘' in all_spot_df.columns else '最新价'
+            return all_spot_df[final_price_key].to_dict(), True
 
-    except Exception as e:
-        bot_data[KEY_FAILURE_COUNT] = bot_data.get(KEY_FAILURE_COUNT, 0) + 1
-        count = bot_data[KEY_FAILURE_COUNT]
-        logger.error(f"获取实时行情失败 (连续第 {count} 次): {e}")
-        if count >= FETCH_FAILURE_THRESHOLD and not bot_data.get(KEY_FAILURE_SENT) and ADMIN_USER_ID:
-            admin_message = (f"🚨 **机器人警报** 🚨\n\n数据获取连续失败已达到 **{count}** 次，超过阈值 ({FETCH_FAILURE_THRESHOLD})。\n\n"
-                             f"请检查机器人日志和网络连接。\n\n最后一次错误: `{e}`")
-            try:
-                await context.bot.send_message(chat_id=ADMIN_USER_ID, text=admin_message, parse_mode=ParseMode.MARKDOWN)
-                logger.warning(f"已向管理员发送数据获取失败的警报通知。")
-                bot_data[KEY_FAILURE_SENT] = True
-            except Exception as notify_e:
-                logger.error(f"发送失败警报给管理员时出错: {notify_e}")
-        return {}, False
+        except Exception as e:
+            logger.warning(f"获取实时行情失败 (尝试 {attempt + 1}/{FETCH_RETRY_ATTEMPTS}): {e}")
+            if attempt < FETCH_RETRY_ATTEMPTS - 1:
+                logger.info(f"将在 {FETCH_RETRY_DELAY_SECONDS} 秒后重试...")
+                await asyncio.sleep(FETCH_RETRY_DELAY_SECONDS)
+            else:
+                # 所有重试均失败
+                logger.error("所有重试均告失败，本次数据获取中止。")
+                context.bot_data[KEY_FAILURE_COUNT] = context.bot_data.get(KEY_FAILURE_COUNT, 0) + 1
+                count = context.bot_data[KEY_FAILURE_COUNT]
+                if count >= FETCH_FAILURE_THRESHOLD and not context.bot_data.get(KEY_FAILURE_SENT) and ADMIN_USER_ID:
+                    admin_message = (f"🚨 **机器人警报** 🚨\n\n数据获取连续失败已达到 **{count}** 次，超过阈值 ({FETCH_FAILURE_THRESHOLD})。\n\n"
+                                     f"请检查机器人日志和网络连接。\n\n最后一次错误: `{e}`")
+                    try:
+                        await context.bot.send_message(chat_id=ADMIN_USER_ID, text=admin_message, parse_mode=ParseMode.MARKDOWN)
+                        logger.warning(f"已向管理员发送数据获取失败的警报通知。")
+                        context.bot_data[KEY_FAILURE_SENT] = True
+                    except Exception as notify_e:
+                        logger.error(f"发送失败警报给管理员时出错: {notify_e}")
+    return {}, False
 
 
 # --- 市场时间检查 ---
@@ -624,19 +632,16 @@ async def post_init(application: Application):
     ]
     await application.bot.set_my_commands(commands)
     bot_data = application.bot_data
-    bot_data[KEY_HIST_CACHE] = {}
+    for key in [KEY_HIST_CACHE, KEY_NAME_CACHE]: bot_data[key] = {}
+    for key in [KEY_FAILURE_COUNT, KEY_FAILURE_SENT]: bot_data[key] = 0
     bot_data[KEY_CACHE_DATE] = None
-    bot_data[KEY_FAILURE_COUNT] = 0
-    bot_data[KEY_FAILURE_SENT] = False
     
-    name_cache = {}
     all_rules = db_execute("SELECT asset_code, asset_name FROM rules", fetchall=True)
     if all_rules:
         for rule in all_rules:
             if rule['asset_code'] and rule['asset_name']:
-                name_cache[rule['asset_code']] = rule['asset_name']
-        logger.info(f"从数据库预加载了 {len(name_cache)} 个资产名称到缓存。")
-    bot_data[KEY_NAME_CACHE] = name_cache
+                bot_data[KEY_NAME_CACHE][rule['asset_code']] = rule['asset_name']
+        logger.info(f"从数据库预加载了 {len(bot_data[KEY_NAME_CACHE])} 个资产名称到缓存。")
     logger.info("Bot application data 初始化完成。")
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -657,6 +662,8 @@ def main():
     logger.info(f"最大随机延迟: {RANDOM_DELAY_MAX_SECONDS}秒")
     logger.info(f"失败通知阈值: {FETCH_FAILURE_THRESHOLD}次")
     logger.info(f"请求间隔: {REQUEST_INTERVAL_SECONDS}秒")
+    logger.info(f"获取数据重试次数: {FETCH_RETRY_ATTEMPTS}")
+    logger.info(f"重试间隔: {FETCH_RETRY_DELAY_SECONDS}秒")
     logger.info(f"每日简报主开关: {'开启' if ENABLE_DAILY_BRIEFING else '关闭'}")
     if ENABLE_DAILY_BRIEFING:
         logger.info(f"每日简报发送时间: {BRIEFING_TIMES_STR} (上海时间)")
