@@ -42,7 +42,8 @@ COPY --chown=appuser:appuser src/ ./src/
 # 环境变量
 ENV DB_FILE=/app/data/rules.db \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    NUMBA_CACHE_DIR=/tmp/numba_cache
 
 # 切换到非特权用户
 USER appuser
