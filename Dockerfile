@@ -1,6 +1,6 @@
 # --- Stage 1: Builder ---
 # 使用一个更新的、受支持的基础镜像
-FROM python:3.11-slim-bookworm AS builder
+FROM python:3.12-slim-bookworm AS builder
 
 WORKDIR /app
 
@@ -18,7 +18,7 @@ RUN pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt
 
 # --- Stage 2: Final Image ---
 # 确保最终镜像和构建镜像使用相同的基础
-FROM python:3.11-slim-bookworm
+FROM python:3.12-slim-bookworm
 
 # 创建非 root 用户
 RUN groupadd -r appuser && \
