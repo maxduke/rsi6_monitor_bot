@@ -12,7 +12,7 @@ aiosignal==1.4.0
     # via aiohttp
 akracer==0.0.14
     # via akshare
-akshare==1.17.80
+akshare==1.18.4
     # via -r requirements.in
 anyio==4.11.0
     # via httpx
@@ -24,11 +24,16 @@ beautifulsoup4==4.14.2
     # via akshare
 certifi==2025.10.5
     # via
+    #   curl-cffi
     #   httpcore
     #   httpx
     #   requests
+cffi==2.0.0
+    # via curl-cffi
 charset-normalizer==3.4.4
     # via requests
+curl-cffi==0.14.0
+    # via akshare
 decorator==5.2.1
     # via akshare
 et-xmlfile==2.0.0
@@ -94,6 +99,8 @@ propcache==0.4.1
     #   yarl
 py-mini-racer==0.6.0
     # via akshare
+pycparser==2.23
+    # via cffi
 pyluach==2.3.0
     # via exchange-calendars
 python-dateutil==2.9.0.post0
