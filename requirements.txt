@@ -4,22 +4,14 @@
 #
 #    pip-compile --output-file=requirements.txt requirements.in
 #
-aiohappyeyeballs==2.6.1
-    # via aiohttp
-aiohttp==3.13.2
-    # via akshare
-aiosignal==1.4.0
-    # via aiohttp
 akracer==0.0.14
     # via akshare
-akshare==1.18.4
+akshare==1.18.20
     # via -r requirements.in
 anyio==4.11.0
     # via httpx
 apscheduler==3.11.1
     # via python-telegram-bot
-attrs==25.4.0
-    # via aiohttp
 beautifulsoup4==4.14.2
     # via akshare
 certifi==2025.10.5
@@ -40,10 +32,6 @@ et-xmlfile==2.0.0
     # via openpyxl
 exchange-calendars==4.11.2
     # via pandas-market-calendars
-frozenlist==1.8.0
-    # via
-    #   aiohttp
-    #   aiosignal
 h11==0.16.0
     # via httpcore
 html5lib==1.1
@@ -57,7 +45,6 @@ idna==3.11
     #   anyio
     #   httpx
     #   requests
-    #   yarl
 jsonpath==0.82.2
     # via akshare
 korean-lunar-calendar==0.3.1
@@ -65,12 +52,6 @@ korean-lunar-calendar==0.3.1
 llvmlite==0.44.0
     # via numba
 lxml==6.0.2
-    # via akshare
-multidict==6.7.0
-    # via
-    #   aiohttp
-    #   yarl
-nest-asyncio==1.6.0
     # via akshare
 numba==0.61.2
     # via pandas-ta
@@ -93,10 +74,6 @@ pandas-market-calendars==5.1.3
     # via -r requirements.in
 pandas-ta==0.4.71b0
     # via -r requirements.in
-propcache==0.4.1
-    # via
-    #   aiohttp
-    #   yarl
 py-mini-racer==0.6.0
     # via akshare
 pycparser==2.23
@@ -131,7 +108,6 @@ tqdm==4.67.1
     #   pandas-ta
 typing-extensions==4.15.0
     # via
-    #   aiosignal
     #   anyio
     #   beautifulsoup4
 tzdata==2025.2
@@ -148,5 +124,3 @@ webencodings==0.5.1
     # via html5lib
 xlrd==2.0.2
     # via akshare
-yarl==1.22.0
-    # via aiohttp
