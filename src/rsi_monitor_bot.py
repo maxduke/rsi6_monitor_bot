@@ -174,12 +174,9 @@ async def get_history_data(asset_code: str) -> Union[pd.DataFrame, None]:
         sina_symbol = get_sina_symbol(asset_code)
         df = None
         adjust_val = "qfq" if USE_ADJUST else ""
-        
-        if asset_code.startswith(STOCK_PREFIXES):
+
+        if asset_code.startswith(STOCK_PREFIXES) or asset_code.startswith(ETF_PREFIXES):
             df = await asyncio.to_thread(ak.stock_zh_a_daily, symbol=sina_symbol, adjust=adjust_val)
-        elif asset_code.startswith(ETF_PREFIXES):
-            # ETF 接口通常返回不复权数据，暂无调节参数
-            df = await asyncio.to_thread(ak.fund_etf_hist_sina, symbol=sina_symbol)
         
         if df is not None and not df.empty:
             rename_map = {'date': '日期', 'close': '收盘', 'open': '开盘', 'high': '最高', 'low': '最低', 'volume': '成交量'}
@@ -201,7 +198,8 @@ async def _fetch_single_realtime_price(code: str) -> Union[float, None]:
     """通过新浪分时接口获取最新价（最稳健）。"""
     sina_symbol = get_sina_symbol(code)
     try:
-        df = await asyncio.to_thread(ak.stock_zh_a_minute, symbol=sina_symbol, period='1')
+        adjust_val = "qfq" if USE_ADJUST else ""
+        df = await asyncio.to_thread(ak.stock_zh_a_minute, symbol=sina_symbol, period='1', adjust=adjust_val)
         if df is not None and not df.empty:
             return float(df.iloc[-1]['close'])
     except Exception as e:
