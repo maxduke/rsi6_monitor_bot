@@ -462,7 +462,11 @@ async def add_rule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent_message = await update.message.reply_text(f"正在验证代码 {asset_code}...")
         
         # 验证代码有效性
-        price = await _fetch_single_realtime_price(asset_code)
+        if asset_code.startswith(ETF_PREFIXES):
+            etf_prices = await _fetch_etf_nav_snapshot(USE_ADJUST)
+            price = etf_prices.get(str(asset_code).strip())
+        else:
+            price = await _fetch_single_realtime_price(asset_code)
         if not price:
             await sent_message.edit_text(f"❌ 错误：无法获取代码 {asset_code} 的数据，请确认代码正确。")
             return
