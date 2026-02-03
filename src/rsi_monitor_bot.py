@@ -5,7 +5,7 @@ import sqlite3
 import pandas as pd
 import pandas_ta as ta
 import akshare as ak
-from datetime import datetime, time, timedelta
+from datetime import datetime, time
 import pytz
 import asyncio
 from functools import wraps
@@ -20,7 +20,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
 from telegram.error import Forbidden
 
-# --- 机器人配置 (从环境变量读取) ---
+# --- 机器人配置（从环境变量读取） ---
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 ADMIN_USER_ID_STR = os.getenv('ADMIN_USER_ID')
 ADMIN_USER_ID = int(ADMIN_USER_ID_STR) if ADMIN_USER_ID_STR and ADMIN_USER_ID_STR.isdigit() else None
@@ -30,24 +30,24 @@ DB_FILE = os.getenv('DB_FILE', 'rules.db')
 # --- 监控参数配置 ---
 RSI_PERIOD = int(os.getenv('RSI_PERIOD', '6'))
 # [配置] 计算模式: 'sma'(默认,国内常用), 'wilder'(国际标准), 'ema'
-RSI_MODE = os.getenv('RSI_MODE', 'sma').lower() 
+RSI_MODE = os.getenv('RSI_MODE', 'sma').lower()
 # [配置] 是否复权: 'true'(默认,前复权), 'false'(不复权)
 USE_ADJUST = os.getenv('USE_ADJUST', 'true').lower() == 'true'
-# 历史数据获取天数 (虽然Sina接口返回全量，但此参数保留用于缓存标识)
+# 历史数据获取天数（Sina 返回全量，保留用于缓存标识）
 HIST_FETCH_DAYS = int(os.getenv('HIST_FETCH_DAYS', '200'))
 MAX_NOTIFICATIONS_PER_TRIGGER = int(os.getenv('MAX_NOTIFICATIONS_PER_TRIGGER', '1'))
 
 # --- 高级配置 ---
 RANDOM_DELAY_MAX_SECONDS = float(os.getenv('RANDOM_DELAY_MAX_SECONDS', '0'))
 FETCH_FAILURE_THRESHOLD = int(os.getenv('FETCH_FAILURE_THRESHOLD', '5'))
-# Sina接口建议间隔稍微大一点，避免高频封禁
+# Sina 接口建议间隔稍微大一点，避免高频封禁
 REQUEST_INTERVAL_SECONDS = float(os.getenv('REQUEST_INTERVAL_SECONDS', '1.0'))
 ENABLE_DAILY_BRIEFING = os.getenv('ENABLE_DAILY_BRIEFING', 'false').lower() == 'true'
 BRIEFING_TIMES_STR = os.getenv('DAILY_BRIEFING_TIMES', '15:30')
 FETCH_RETRY_ATTEMPTS = int(os.getenv('FETCH_RETRY_ATTEMPTS', '3'))
 FETCH_RETRY_DELAY_SECONDS = int(os.getenv('FETCH_RETRY_DELAY_SECONDS', '5'))
 
-# --- 日志配置 (保持原版详细风格) ---
+# --- 日志配置（保持原版详细风格） ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 for logger_name in ["httpx", "telegram.ext", "apscheduler"]:
     logging.getLogger(logger_name).setLevel(logging.WARNING)
@@ -65,7 +65,7 @@ ETF_PREFIXES = ('5', '1')
 CHINA_CALENDAR = mcal.get_calendar('XSHG')
 
 
-# --- 数据库模块 (保持原版) ---
+# --- 数据库模块 ---
 def db_init():
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
@@ -93,18 +93,32 @@ def db_execute(query, params=(), fetchone=False, fetchall=False):
             cursor = conn.cursor()
             cursor.execute(query, params)
             conn.commit()
-            if fetchone: return cursor.fetchone()
-            if fetchall: return cursor.fetchall()
+            if fetchone:
+                return cursor.fetchone()
+            if fetchall:
+                return cursor.fetchall()
             return None
     except sqlite3.Error as e:
         logger.error(f"数据库操作失败: {e}")
         return None
 
-# --- 白名单与装饰器 (保持原版) ---
-def is_whitelisted(user_id: int) -> bool: return db_execute("SELECT 1 FROM whitelist WHERE user_id = ?", (user_id,), fetchone=True) is not None
-def add_to_whitelist(user_id: int): db_execute("INSERT OR IGNORE INTO whitelist (user_id) VALUES (?)", (user_id,))
-def remove_from_whitelist(user_id: int): db_execute("DELETE FROM whitelist WHERE user_id = ?", (user_id,))
-def get_whitelist(): return db_execute("SELECT * FROM whitelist", fetchall=True)
+# --- 白名单与装饰器 ---
+def is_whitelisted(user_id: int) -> bool:
+    return db_execute("SELECT 1 FROM whitelist WHERE user_id = ?", (user_id,), fetchone=True) is not None
+
+
+def add_to_whitelist(user_id: int):
+    db_execute("INSERT OR IGNORE INTO whitelist (user_id) VALUES (?)", (user_id,))
+
+
+def remove_from_whitelist(user_id: int):
+    db_execute("DELETE FROM whitelist WHERE user_id = ?", (user_id,))
+
+
+def get_whitelist():
+    return db_execute("SELECT * FROM whitelist", fetchall=True)
+
+
 def whitelisted_only(func):
     @wraps(func)
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
@@ -122,13 +136,16 @@ def admin_only(func):
         return await func(update, context, *args, **kwargs)
     return wrapped
 
-# --- 核心：数据获取与计算模块 (优化版) ---
+# --- 核心：数据获取与计算模块 ---
 
 def get_sina_symbol(code: str) -> str:
-    """转换代码为新浪接口格式"""
-    if code.startswith(('6', '5', '9')): return f"sh{code}"
-    elif code.startswith(('0', '3', '1', '2')): return f"sz{code}"
-    elif code.startswith(('4', '8')): return f"bj{code}"
+    """转换代码为新浪接口格式。"""
+    if code.startswith(('6', '5', '9')):
+        return f"sh{code}"
+    if code.startswith(('0', '3', '1', '2')):
+        return f"sz{code}"
+    if code.startswith(('4', '8')):
+        return f"bj{code}"
     return code
 
 async def get_asset_name_with_cache(asset_code: str, context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -139,13 +156,9 @@ async def get_asset_name_with_cache(asset_code: str, context: ContextTypes.DEFAU
     
     logger.info(f"缓存未命中，尝试获取资产名称: {asset_code}")
     await asyncio.sleep(REQUEST_INTERVAL_SECONDS)
-    # 默认回退名称
+    # 默认回退名称（名称不是核心逻辑，未来可替换为更精确的数据源）
     name = f"Asset_{asset_code}"
-    
-    # 这里我们简化逻辑：名称不是核心功能，Sina接口获取名称比较麻烦
-    # 如果未来需要精确名称，可以尝试 ak.stock_individual_info_em (如果它恢复可用)
-    # 目前保持简单，仅作为占位，或者在添加规则时用户自己知道
-    
+
     if name:
         name_cache[asset_code] = name
         logger.debug(f"已将新资产名称存入缓存: {asset_code} -> {name}")
@@ -154,8 +167,8 @@ async def get_asset_name_with_cache(asset_code: str, context: ContextTypes.DEFAU
 
 async def get_history_data(asset_code: str) -> Union[pd.DataFrame, None]:
     """
-    获取全量历史数据 (Sina源)
-    优化点：不截断数据，确保RSI算法收敛；处理今日数据剔除。
+    获取全量历史数据（Sina 源）。
+    注意：保留完整历史用于 RSI 收敛，并剔除今日不完整数据。
     """
     try:
         sina_symbol = get_sina_symbol(asset_code)
@@ -174,7 +187,7 @@ async def get_history_data(asset_code: str) -> Union[pd.DataFrame, None]:
             df['日期'] = pd.to_datetime(df['日期'])
             df.set_index('日期', inplace=True)
             
-            # 剔除今日 (防止日线接口返回不完整的今日数据，导致重复)
+            # 剔除今日：防止日线接口返回不完整的今日数据
             today = datetime.now(pytz.timezone('Asia/Shanghai')).date()
             if df.index[-1].date() == today:
                 df = df.iloc[:-1]
@@ -185,7 +198,7 @@ async def get_history_data(asset_code: str) -> Union[pd.DataFrame, None]:
         return None
 
 async def _fetch_single_realtime_price(code: str) -> Union[float, None]:
-    """通过新浪分时接口获取最新价 (最稳健)"""
+    """通过新浪分时接口获取最新价（最稳健）。"""
     sina_symbol = get_sina_symbol(code)
     try:
         df = await asyncio.to_thread(ak.stock_zh_a_minute, symbol=sina_symbol, period='1')
@@ -202,10 +215,11 @@ async def _fetch_all_spot_data(context: ContextTypes.DEFAULT_TYPE, codes: List[s
     """
     spot_dict = {}
     success_count = 0
+    spot_interval = max(0.3, REQUEST_INTERVAL_SECONDS)
     
-    # 逐个获取，虽然慢一点但稳定
+    # 逐个获取，虽然慢一点但更稳定
     for code in codes:
-        await asyncio.sleep(0.3) # 避免速率限制
+        await asyncio.sleep(spot_interval)  # 避免速率限制
         price = await _fetch_single_realtime_price(code)
         if price is not None:
             spot_dict[code] = price
@@ -223,35 +237,42 @@ async def _fetch_all_spot_data(context: ContextTypes.DEFAULT_TYPE, codes: List[s
                 await context.bot.send_message(chat_id=ADMIN_USER_ID, text=admin_message, parse_mode=ParseMode.MARKDOWN)
                 logger.warning(f"已向管理员发送数据获取失败的警报通知。")
                 context.bot_data[KEY_FAILURE_SENT] = True
-            except: pass
+            except Exception:
+                pass
         return {}, False
     
     # 成功获取，重置失败计数器
-    if context.bot_data.get(KEY_FAILURE_COUNT, 0) > 0: logger.info("数据获取成功，重置失败计数器。")
+    if context.bot_data.get(KEY_FAILURE_COUNT, 0) > 0:
+        logger.info("数据获取成功，重置失败计数器。")
     context.bot_data[KEY_FAILURE_COUNT] = 0
     context.bot_data[KEY_FAILURE_SENT] = False
     return spot_dict, True
 
 
 def get_prices_for_rsi(hist_df: pd.DataFrame, spot_price: float) -> Union[pd.Series, None]:
-    """根据历史和实时价格准备用于RSI计算的价格序列。"""
-    if hist_df is None or hist_df.empty: return None
+    """根据历史和实时价格准备用于 RSI 计算的价格序列。"""
+    if hist_df is None or hist_df.empty:
+        return None
     close_prices = hist_df['收盘'].copy()
     
-    # 拼接今日最新价
+    # 拼接今日最新价（如果已有同日数据则覆盖）
     today_ts = pd.Timestamp(datetime.now(pytz.timezone('Asia/Shanghai')).date())
+    if today_ts in close_prices.index:
+        close_prices = close_prices.drop(today_ts)
     new_row = pd.Series([float(spot_price)], index=[today_ts])
     combined_prices = pd.concat([close_prices, new_row])
     
     return combined_prices
 
 def calculate_rsi(prices: pd.Series) -> Union[float, None]:
-    """从价格序列计算RSI (使用配置的模式)。"""
+    """从价格序列计算 RSI（使用配置的模式）。"""
     try:
-        if len(prices) < RSI_PERIOD + 2: return None
+        if len(prices) < RSI_PERIOD + 2:
+            return None
         # 使用环境变量配置的模式 (sma/wilder/ema)
         rsi = ta.rsi(prices, length=RSI_PERIOD, mamode=RSI_MODE)
-        if rsi is None or rsi.empty: return None
+        if rsi is None or rsi.empty:
+            return None
         return round(rsi.iloc[-1], 2)
     except Exception as e:
         logger.error(f"计算RSI时出错: {e}")
@@ -265,8 +286,9 @@ def is_market_hours() -> bool:
     now = datetime.now(tz)
     if not is_trading_day(now): return False
     time_now = now.time()
-    return (time(9, 30) <= time_now <= time(11, 30)) or \
-           (time(13, 0) <= time_now <= time(15, 0))
+    return (time(9, 30) <= time_now <= time(11, 30)) or (
+        time(13, 0) <= time_now <= time(15, 0)
+    )
 
 
 # --- Telegram 命令处理 ---
@@ -319,7 +341,8 @@ async def check_rsi_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sent_message = await update.message.reply_text("正在查询您规则中所有资产的最新RSI值，请稍候...")
     
     rules_by_code = defaultdict(list)
-    for rule in rules: rules_by_code[rule['asset_code']].append(rule)
+    for rule in rules:
+        rules_by_code[rule['asset_code']].append(rule)
     unique_codes = sorted(list(rules_by_code.keys()))
     
     rsi_results = {}
@@ -391,7 +414,7 @@ async def add_rule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         parts = update.message.text.split()
         if len(parts) != 4:
-            await update.message.reply_text("命令格式错误。\n正确格式: /add <code> <min_rsi> <max_rsi>")
+            await update.message.reply_text("命令格式错误。\n正确格式: /add <CODE> <min_rsi> <max_rsi>")
             return
         _, asset_code, rsi_min_str, rsi_max_str = parts
         rsi_min = float(rsi_min_str); rsi_max = float(rsi_max_str)
@@ -403,8 +426,8 @@ async def add_rule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 验证代码有效性
         price = await _fetch_single_realtime_price(asset_code)
         if not price:
-             await sent_message.edit_text(f"❌ 错误：无法获取代码 {asset_code} 的数据，请确认代码正确。")
-             return
+            await sent_message.edit_text(f"❌ 错误：无法获取代码 {asset_code} 的数据，请确认代码正确。")
+            return
 
         asset_name = await get_asset_name_with_cache(asset_code, context)
         try:
@@ -497,7 +520,9 @@ async def del_whitelist_command(update: Update, context: ContextTypes.DEFAULT_TY
 @admin_only
 async def list_whitelist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = db_execute("SELECT * FROM whitelist", fetchall=True)
-    if not users: await update.message.reply_text("白名单中没有任何用户。"); return
+    if not users:
+        await update.message.reply_text("白名单中没有任何用户。")
+        return
     message = "<b>白名单用户列表:</b>\n\n"
     for user in users:
         is_admin_text = " (管理员)" if user['user_id'] == ADMIN_USER_ID else ""
@@ -508,7 +533,8 @@ async def list_whitelist_command(update: Update, context: ContextTypes.DEFAULT_T
 
 # --- 后台监控任务 ---
 async def check_rules_job(context: ContextTypes.DEFAULT_TYPE):
-    if not is_market_hours(): return
+    if not is_market_hours():
+        return
     if RANDOM_DELAY_MAX_SECONDS > 0:
         delay = random.uniform(0, RANDOM_DELAY_MAX_SECONDS)
         logger.info(f"应用启动延迟: {delay:.2f}秒")
@@ -516,7 +542,8 @@ async def check_rules_job(context: ContextTypes.DEFAULT_TYPE):
     
     logger.info("交易时间，开始执行规则检查...")
     active_rules = db_execute("SELECT * FROM rules WHERE is_active = 1", fetchall=True)
-    if not active_rules: return
+    if not active_rules:
+        return
 
     bot_data = context.bot_data
     all_codes = {rule['asset_code'] for rule in active_rules}
@@ -541,17 +568,20 @@ async def check_rules_job(context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(REQUEST_INTERVAL_SECONDS)
 
     spot_data, success = await _fetch_all_spot_data(context, list(all_codes))
-    if not success: return
+    if not success:
+        return
 
     for rule in active_rules:
         asset_code = rule['asset_code']
         hist_df = hist_data_cache.get(asset_code)
         spot_price = spot_data.get(asset_code)
-        if hist_df is None or spot_price is None: continue
+        if hist_df is None or spot_price is None:
+            continue
         
         prices = get_prices_for_rsi(hist_df, spot_price)
         current_rsi = calculate_rsi(prices)
-        if current_rsi is None: continue
+        if current_rsi is None:
+            continue
 
         logger.debug(f"检查: {rule['asset_name']}({asset_code}) | RSI({RSI_PERIOD}): {current_rsi}")
         is_triggered = rule['rsi_min'] <= current_rsi <= rule['rsi_max']
@@ -568,13 +598,14 @@ async def check_rules_job(context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"向用户 {rule['user_id']} 发送通知失败: {e}")
         elif not is_triggered and last_notified_rsi_in_range:
-             logger.info(f"离开区间: {asset_code} | 重置通知计数器。")
-             db_execute("UPDATE rules SET last_notified_rsi = ?, notification_count = 0 WHERE id = ?", (current_rsi, rule['id']))
+            logger.info(f"离开区间: {asset_code} | 重置通知计数器。")
+            db_execute("UPDATE rules SET last_notified_rsi = ?, notification_count = 0 WHERE id = ?", (current_rsi, rule['id']))
         elif is_triggered:
             db_execute("UPDATE rules SET last_notified_rsi = ? WHERE id = ?", (current_rsi, rule['id']))
 
 async def daily_briefing_job(context: ContextTypes.DEFAULT_TYPE):
-    if not ENABLE_DAILY_BRIEFING: return
+    if not ENABLE_DAILY_BRIEFING:
+        return
     tz = pytz.timezone('Asia/Shanghai')
     now = datetime.now(tz)
     if not is_trading_day(now):
@@ -583,11 +614,13 @@ async def daily_briefing_job(context: ContextTypes.DEFAULT_TYPE):
     
     logger.info("开始执行每日收盘RSI简报任务...")
     enabled_users_rows = db_execute("SELECT user_id FROM whitelist WHERE daily_briefing_enabled = 1", fetchall=True)
-    if not enabled_users_rows: return
+    if not enabled_users_rows:
+        return
     
     enabled_user_ids = {row['user_id'] for row in enabled_users_rows}
     all_briefing_rules = db_execute("SELECT * FROM rules WHERE is_active = 1 AND user_id IN ({})".format(','.join('?' for _ in enabled_user_ids)), tuple(enabled_user_ids), fetchall=True)
-    if not all_briefing_rules: return
+    if not all_briefing_rules:
+        return
 
     all_unique_codes = sorted(list({rule['asset_code'] for rule in all_briefing_rules}))
     
@@ -615,12 +648,14 @@ async def daily_briefing_job(context: ContextTypes.DEFAULT_TYPE):
 
     today_str_display = now.strftime('%Y年%m月%d日')
     rules_by_user = defaultdict(list)
-    for rule in all_briefing_rules: rules_by_user[rule['user_id']].append(rule)
+    for rule in all_briefing_rules:
+        rules_by_user[rule['user_id']].append(rule)
         
     for user_id, user_rules in rules_by_user.items():
         message = f"📰 <b>收盘RSI简报 ({today_str_display})</b>\n\n"
         user_rules_by_code = defaultdict(list)
-        for rule in user_rules: user_rules_by_code[rule['asset_code']].append(rule)
+        for rule in user_rules:
+            user_rules_by_code[rule['asset_code']].append(rule)
         
         for code, code_rules in sorted(user_rules_by_code.items()):
             asset_name = code_rules[0]['asset_name']
@@ -630,10 +665,12 @@ async def daily_briefing_job(context: ContextTypes.DEFAULT_TYPE):
                 icon = "🎯" if is_triggered else "▪️"
                 rsi_str = f"<b>{rsi_val:.2f}</b>"
             else:
-                icon = "❓"; rsi_str = "查询失败"
+                icon = "❓"
+                rsi_str = "查询失败"
             message += f"{icon} <b>{asset_name}</b> (<code>{code}</code>)\n"
             message += f"  - 收盘 RSI({RSI_PERIOD}): {rsi_str}\n"
-            for rule in code_rules: message += f"  - 监控区间: {rule['rsi_min']} - {rule['rsi_max']}\n"
+            for rule in code_rules:
+                message += f"  - 监控区间: {rule['rsi_min']} - {rule['rsi_max']}\n"
             message += "\n"
         try:
             await context.bot.send_message(chat_id=user_id, text=message, parse_mode=ParseMode.HTML)
@@ -656,8 +693,10 @@ async def post_init(application: Application):
     ]
     await application.bot.set_my_commands(commands)
     bot_data = application.bot_data
-    for key in [KEY_HIST_CACHE, KEY_NAME_CACHE]: bot_data[key] = {}
-    for key in [KEY_FAILURE_COUNT, KEY_FAILURE_SENT]: bot_data[key] = 0
+    for key in [KEY_HIST_CACHE, KEY_NAME_CACHE]:
+        bot_data[key] = {}
+    for key in [KEY_FAILURE_COUNT, KEY_FAILURE_SENT]:
+        bot_data[key] = 0
     bot_data[KEY_CACHE_DATE] = None
     
     # 预加载缓存
