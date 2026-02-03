@@ -15,6 +15,8 @@ import random
 import pandas_market_calendars as mcal
 from collections import defaultdict
 
+from etf_data import fetch_etf_history_sina
+
 from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
@@ -171,18 +173,22 @@ async def get_history_data(asset_code: str) -> Union[pd.DataFrame, None]:
     注意：保留完整历史用于 RSI 收敛，并剔除今日不完整数据。
     """
     try:
-        sina_symbol = get_sina_symbol(asset_code)
         df = None
         adjust_val = "qfq" if USE_ADJUST else ""
 
-        if asset_code.startswith(STOCK_PREFIXES) or asset_code.startswith(ETF_PREFIXES):
+        if asset_code.startswith(ETF_PREFIXES):
+            df = await asyncio.to_thread(fetch_etf_history_sina, asset_code, USE_ADJUST)
+        elif asset_code.startswith(STOCK_PREFIXES):
+            sina_symbol = get_sina_symbol(asset_code)
             df = await asyncio.to_thread(ak.stock_zh_a_daily, symbol=sina_symbol, adjust=adjust_val)
         
         if df is not None and not df.empty:
             rename_map = {'date': '日期', 'close': '收盘', 'open': '开盘', 'high': '最高', 'low': '最低', 'volume': '成交量'}
-            df.rename(columns=rename_map, inplace=True)
-            df['日期'] = pd.to_datetime(df['日期'])
-            df.set_index('日期', inplace=True)
+            if 'date' in df.columns:
+                df.rename(columns=rename_map, inplace=True)
+            if '日期' in df.columns:
+                df['日期'] = pd.to_datetime(df['日期'])
+                df.set_index('日期', inplace=True)
             
             # 剔除今日：防止日线接口返回不完整的今日数据
             today = datetime.now(pytz.timezone('Asia/Shanghai')).date()
@@ -196,15 +202,38 @@ async def get_history_data(asset_code: str) -> Union[pd.DataFrame, None]:
 
 async def _fetch_single_realtime_price(code: str) -> Union[float, None]:
     """通过新浪分时接口获取最新价（最稳健）。"""
-    sina_symbol = get_sina_symbol(code)
     try:
-        adjust_val = "qfq" if USE_ADJUST else ""
-        df = await asyncio.to_thread(ak.stock_zh_a_minute, symbol=sina_symbol, period='1', adjust=adjust_val)
-        if df is not None and not df.empty:
-            return float(df.iloc[-1]['close'])
+        if code.startswith(STOCK_PREFIXES):
+            sina_symbol = get_sina_symbol(code)
+            adjust_val = "qfq" if USE_ADJUST else ""
+            df = await asyncio.to_thread(ak.stock_zh_a_minute, symbol=sina_symbol, period='1', adjust=adjust_val)
+            if df is not None and not df.empty:
+                return float(df.iloc[-1]['close'])
     except Exception as e:
         logger.warning(f"获取 {code} 实时价格失败: {e}")
     return None
+
+async def _fetch_etf_nav_snapshot(use_adjust: bool) -> Dict[str, float]:
+    """使用东方财富日度净值接口获取 ETF 实时净值快照（一次性返回所有基金）。"""
+    value_suffix = "累计净值" if use_adjust else "单位净值"
+    try:
+        df = await asyncio.to_thread(ak.fund_open_fund_daily_em)
+    except Exception as exc:
+        logger.warning(f"获取ETF实时净值快照失败: {exc}")
+        return {}
+    if df is None or df.empty or "基金代码" not in df.columns:
+        logger.warning(f"ETF实时净值快照缺列: columns={getattr(df, 'columns', None)}")
+        return {}
+    nav_columns = [col for col in df.columns if isinstance(col, str) and col.endswith(value_suffix)]
+    if not nav_columns:
+        logger.warning(f"ETF实时净值快照缺少净值列: suffix={value_suffix} columns={getattr(df, 'columns', None)}")
+        return {}
+    latest_nav_col = max(nav_columns)
+    df = df[["基金代码", latest_nav_col]].copy()
+    df[latest_nav_col] = pd.to_numeric(df[latest_nav_col], errors="coerce")
+    df["基金代码"] = df["基金代码"].astype(str).str.strip()
+    df.dropna(subset=["基金代码", latest_nav_col], inplace=True)
+    return dict(zip(df["基金代码"], df[latest_nav_col].astype(float)))
 
 async def _fetch_all_spot_data(context: ContextTypes.DEFAULT_TYPE, codes: List[str], price_key: str = '最新价') -> Tuple[Dict, bool]:
     """
@@ -215,8 +244,19 @@ async def _fetch_all_spot_data(context: ContextTypes.DEFAULT_TYPE, codes: List[s
     success_count = 0
     spot_interval = max(0.3, REQUEST_INTERVAL_SECONDS)
     
-    # 逐个获取，虽然慢一点但更稳定
-    for code in codes:
+    etf_codes = [code for code in codes if code.startswith(ETF_PREFIXES)]
+    stock_codes = [code for code in codes if code.startswith(STOCK_PREFIXES)]
+
+    if etf_codes:
+        etf_prices = await _fetch_etf_nav_snapshot(USE_ADJUST)
+        for code in etf_codes:
+            price = etf_prices.get(str(code).strip())
+            if price is not None:
+                spot_dict[code] = price
+                success_count += 1
+
+    # 逐个获取股票，虽然慢一点但更稳定
+    for code in stock_codes:
         await asyncio.sleep(spot_interval)  # 避免速率限制
         price = await _fetch_single_realtime_price(code)
         if price is not None:
@@ -422,7 +462,11 @@ async def add_rule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent_message = await update.message.reply_text(f"正在验证代码 {asset_code}...")
         
         # 验证代码有效性
-        price = await _fetch_single_realtime_price(asset_code)
+        if asset_code.startswith(ETF_PREFIXES):
+            etf_prices = await _fetch_etf_nav_snapshot(USE_ADJUST)
+            price = etf_prices.get(str(asset_code).strip())
+        else:
+            price = await _fetch_single_realtime_price(asset_code)
         if not price:
             await sent_message.edit_text(f"❌ 错误：无法获取代码 {asset_code} 的数据，请确认代码正确。")
             return
