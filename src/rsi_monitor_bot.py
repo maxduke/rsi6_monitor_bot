@@ -231,7 +231,7 @@ async def _fetch_etf_nav_snapshot(use_adjust: bool) -> Dict[str, float]:
     latest_nav_col = max(nav_columns)
     df = df[["基金代码", latest_nav_col]].copy()
     df[latest_nav_col] = pd.to_numeric(df[latest_nav_col], errors="coerce")
-    df["基金代码"] = df["基金代码"].astype(str).str.zfill(6)
+    df["基金代码"] = df["基金代码"].astype(str).str.strip()
     df.dropna(subset=["基金代码", latest_nav_col], inplace=True)
     return dict(zip(df["基金代码"], df[latest_nav_col].astype(float)))
 
@@ -250,7 +250,7 @@ async def _fetch_all_spot_data(context: ContextTypes.DEFAULT_TYPE, codes: List[s
     if etf_codes:
         etf_prices = await _fetch_etf_nav_snapshot(USE_ADJUST)
         for code in etf_codes:
-            price = etf_prices.get(code)
+            price = etf_prices.get(str(code).strip())
             if price is not None:
                 spot_dict[code] = price
                 success_count += 1
