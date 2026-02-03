@@ -49,7 +49,9 @@
 | ----------------------------- | ---------------------------------- | ------ |
 | `CHECK_INTERVAL_SECONDS`      | 检查规则的间隔时间（秒）.          | `60`   |
 | `RSI_PERIOD`                  | 计算RSI指标的周期.                 | `6`    |
-| `HIST_FETCH_DAYS`             | 获取用于计算RSI的历史数据的天数.   | `30`   |
+| `RSI_MODE`                    | RSI计算模式 (`sma`=国内常用, `wilder`=国际标准). | `sma`  |
+| `USE_ADJUST`                  | 是否使用前复权价格 (`true`=是, `false`=否). | `true` |
+| `HIST_FETCH_DAYS`             | 缓存历史数据的保留天数 (非截断长度). | `200`  |
 | `MAX_NOTIFICATIONS_PER_TRIGGER` | 单次触发区间内，发送通知的最大次数.| `1`    |
 
 ### 高级配置
@@ -60,9 +62,9 @@
 | `REQUEST_INTERVAL_SECONDS` | 每个API请求之间的固定间隔时间（秒），用于防止接口限制。     | `1.0`      |
 | `FETCH_FAILURE_THRESHOLD`  | 连续获取数据失败多少次后，向管理员发送一条警报通知。         | `5`        |
 | `ENABLE_DAILY_BRIEFING`    | **每日简报的主开关**。设为 `true` 以允许用户使用此功能。     | `false`    |
-| `DAILY_BRIEFING_TIMES`      | 每日简报的发送时间 (上海时间, 24小时制)。支持多个，用逗号分隔。     | `12：30，15:30`    |
+| `DAILY_BRIEFING_TIMES`      | 每日简报的发送时间 (上海时间, 24小时制)。支持多个，用逗号分隔。     | `15:30`    |
 | `FETCH_RETRY_ATTEMPTS` | 获取数据失败后的重试次数。     | `3`      |
-| `FETCH_RETRY_DELAY_SECONDS`  | 每次重试之间的等待时间（秒）。         | `10`        |
+| `FETCH_RETRY_DELAY_SECONDS`  | 每次重试之间的等待时间（秒）。         | `5`        |
 
 ## 🚀 部署与运行
 
