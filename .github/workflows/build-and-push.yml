@@ -2,6 +2,7 @@ name: Build and Push Multi-Arch Docker Image
 
 # 当有代码推送到 main 分支时触发
 on:
+  workflow_dispatch:
   push:
     branches: [ "main" ]
 
