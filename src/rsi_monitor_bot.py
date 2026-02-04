@@ -61,6 +61,7 @@ KEY_FAILURE_COUNT = 'fetch_failure_count'
 KEY_FAILURE_SENT = 'failure_notification_sent'
 STOCK_PREFIXES = ('0', '3', '6', '4', '8')
 ETF_PREFIXES = ('5', '1')
+VALID_RSI_MODES = {'sma', 'wilder', 'ema'}
 
 CHINA_CALENDAR = mcal.get_calendar('XSHG')
 
@@ -124,6 +125,28 @@ def admin_only(func):
 
 # --- 核心：数据获取与计算模块 (优化版) ---
 
+async def _run_with_retries(operation, description: str):
+    for attempt in range(1, FETCH_RETRY_ATTEMPTS + 1):
+        result = await operation()
+        if result is not None:
+            return result
+        if attempt < FETCH_RETRY_ATTEMPTS:
+            logger.warning(
+                f"{description} 失败，{FETCH_RETRY_DELAY_SECONDS}秒后重试 "
+                f"({attempt}/{FETCH_RETRY_ATTEMPTS})。"
+            )
+            await asyncio.sleep(FETCH_RETRY_DELAY_SECONDS)
+    return None
+
+def ensure_daily_history_cache(context: ContextTypes.DEFAULT_TYPE, now: datetime) -> Dict[str, pd.DataFrame]:
+    bot_data = context.bot_data
+    today_str = now.strftime('%Y-%m-%d')
+    if bot_data.get(KEY_CACHE_DATE) != today_str:
+        logger.info(f"日期变更或首次运行，清空并重建 {today_str} 的历史数据缓存。")
+        bot_data[KEY_HIST_CACHE] = {}
+        bot_data[KEY_CACHE_DATE] = today_str
+    return bot_data.get(KEY_HIST_CACHE, {})
+
 def get_sina_symbol(code: str) -> str:
     """转换代码为新浪接口格式"""
     if code.startswith(('6', '5', '9')): return f"sh{code}"
@@ -139,18 +162,30 @@ async def get_asset_name_with_cache(asset_code: str, context: ContextTypes.DEFAU
     
     logger.info(f"缓存未命中，尝试获取资产名称: {asset_code}")
     await asyncio.sleep(REQUEST_INTERVAL_SECONDS)
-    # 默认回退名称
-    name = f"Asset_{asset_code}"
-    
-    # 这里我们简化逻辑：名称不是核心功能，Sina接口获取名称比较麻烦
-    # 如果未来需要精确名称，可以尝试 ak.stock_individual_info_em (如果它恢复可用)
-    # 目前保持简单，仅作为占位，或者在添加规则时用户自己知道
-    
-    if name:
-        name_cache[asset_code] = name
-        logger.debug(f"已将新资产名称存入缓存: {asset_code} -> {name}")
-        return name
-    return f"未知资产({asset_code})"
+    name = None
+
+    async def fetch_name():
+        if asset_code.startswith(STOCK_PREFIXES):
+            info_df = await asyncio.to_thread(ak.stock_individual_info_em, symbol=asset_code)
+            if info_df is not None and not info_df.empty and 'value' in info_df.columns:
+                match = info_df.loc[info_df['item'] == '股票简称', 'value']
+                if not match.empty:
+                    return match.iloc[0]
+        if asset_code.startswith(ETF_PREFIXES):
+            name_df = await asyncio.to_thread(ak.fund_name_em)
+            if name_df is not None and not name_df.empty:
+                match = name_df.loc[name_df['基金代码'] == asset_code, '基金简称']
+                if not match.empty:
+                    return match.iloc[0]
+        return None
+
+    name = await _run_with_retries(fetch_name, f"获取资产名称({asset_code})")
+    if not name:
+        name = f"Asset_{asset_code}"
+
+    name_cache[asset_code] = name
+    logger.debug(f"已将新资产名称存入缓存: {asset_code} -> {name}")
+    return name
 
 async def get_history_data(asset_code: str, days: int) -> Union[pd.DataFrame, None]:
     """获取单个资产的历史日线数据。"""
@@ -158,11 +193,32 @@ async def get_history_data(asset_code: str, days: int) -> Union[pd.DataFrame, No
         today = datetime.now()
         start_date = (today - timedelta(days=days)).strftime('%Y%m%d')
         end_date = today.strftime('%Y%m%d')
-        if asset_code.startswith(STOCK_PREFIXES):
-            df = await asyncio.to_thread(ak.stock_zh_a_hist, symbol=asset_code, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
-        elif asset_code.startswith(ETF_PREFIXES):
-            df = await asyncio.to_thread(ak.fund_etf_hist_em, symbol=asset_code, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
-        else: return None
+        adjust = "qfq" if USE_ADJUST else ""
+
+        async def fetch_hist():
+            if asset_code.startswith(STOCK_PREFIXES):
+                return await asyncio.to_thread(
+                    ak.stock_zh_a_hist,
+                    symbol=asset_code,
+                    period="daily",
+                    start_date=start_date,
+                    end_date=end_date,
+                    adjust=adjust,
+                )
+            if asset_code.startswith(ETF_PREFIXES):
+                return await asyncio.to_thread(
+                    ak.fund_etf_hist_em,
+                    symbol=asset_code,
+                    period="daily",
+                    start_date=start_date,
+                    end_date=end_date,
+                    adjust=adjust,
+                )
+            return None
+
+        df = await _run_with_retries(fetch_hist, f"获取历史数据({asset_code})")
+        if df is None:
+            return None
         if df is not None and not df.empty:
             df['日期'] = pd.to_datetime(df['日期'])
             df.set_index('日期', inplace=True)
@@ -174,13 +230,16 @@ async def get_history_data(asset_code: str, days: int) -> Union[pd.DataFrame, No
 async def _fetch_single_realtime_price(code: str) -> Union[float, None]:
     """通过新浪分时接口获取最新价 (最稳健)"""
     sina_symbol = get_sina_symbol(code)
-    try:
-        df = await asyncio.to_thread(ak.stock_zh_a_minute, symbol=sina_symbol, period='1')
-        if df is not None and not df.empty:
-            return float(df.iloc[-1]['close'])
-    except Exception as e:
-        logger.warning(f"获取 {code} 实时价格失败: {e}")
-    return None
+    async def fetch_price():
+        try:
+            df = await asyncio.to_thread(ak.stock_zh_a_minute, symbol=sina_symbol, period='1')
+            if df is not None and not df.empty:
+                return float(df.iloc[-1]['close'])
+        except Exception as e:
+            logger.warning(f"获取 {code} 实时价格失败: {e}")
+        return None
+
+    return await _run_with_retries(fetch_price, f"获取实时价格({code})")
 
 async def _fetch_all_spot_data(context: ContextTypes.DEFAULT_TYPE, codes: List[str], price_key: str = '最新价') -> Tuple[Dict, bool]:
     """
@@ -192,7 +251,7 @@ async def _fetch_all_spot_data(context: ContextTypes.DEFAULT_TYPE, codes: List[s
     
     # 逐个获取，虽然慢一点但稳定
     for code in codes:
-        await asyncio.sleep(0.3) # 避免速率限制
+        await asyncio.sleep(REQUEST_INTERVAL_SECONDS) # 避免速率限制
         price = await _fetch_single_realtime_price(code)
         if price is not None:
             spot_dict[code] = price
@@ -510,13 +569,8 @@ async def check_rules_job(context: ContextTypes.DEFAULT_TYPE):
     bot_data = context.bot_data
     all_codes = {rule['asset_code'] for rule in active_rules}
     
-    today_str = datetime.now(pytz.timezone('Asia/Shanghai')).strftime('%Y-%m-%d')
-    if bot_data.get(KEY_CACHE_DATE) != today_str:
-        logger.info(f"日期变更或首次运行，清空并重建 {today_str} 的历史数据缓存。")
-        bot_data[KEY_HIST_CACHE] = {}
-        bot_data[KEY_CACHE_DATE] = today_str
-    
-    hist_data_cache = bot_data.get(KEY_HIST_CACHE, {})
+    now = datetime.now(pytz.timezone('Asia/Shanghai'))
+    hist_data_cache = ensure_daily_history_cache(context, now)
     codes_to_fetch_hist = [code for code in all_codes if code not in hist_data_cache]
     
     if codes_to_fetch_hist:
@@ -585,6 +639,8 @@ async def daily_briefing_job(context: ContextTypes.DEFAULT_TYPE):
         logger.error("执行每日简报任务时获取数据失败，任务中止。")
         return
 
+    hist_data_cache = ensure_daily_history_cache(context, now)
+
     rsi_results: Dict[str, Union[str, float]] = {}
     for code in all_unique_codes:
         spot_price = spot_data.get(code)
@@ -592,11 +648,14 @@ async def daily_briefing_job(context: ContextTypes.DEFAULT_TYPE):
             rsi_results[code] = "N/A"
             continue
         
-        await asyncio.sleep(REQUEST_INTERVAL_SECONDS)
-        hist_df = await get_history_data(code, HIST_FETCH_DAYS)
+        hist_df = hist_data_cache.get(code)
         if hist_df is None:
-            rsi_results[code] = "N/A"
-            continue
+            await asyncio.sleep(REQUEST_INTERVAL_SECONDS)
+            hist_df = await get_history_data(code, HIST_FETCH_DAYS)
+            if hist_df is None:
+                rsi_results[code] = "N/A"
+                continue
+            hist_data_cache[code] = hist_df
         
         prices = get_prices_for_rsi(hist_df, spot_price)
         rsi_value = calculate_rsi(prices) if prices is not None else "N/A"
@@ -664,9 +723,15 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def main():
     """主函数，用于启动机器人。"""
+    global RSI_MODE
     if not TELEGRAM_TOKEN or not ADMIN_USER_ID:
         logger.critical("错误: 环境变量 TELEGRAM_TOKEN 和 ADMIN_USER_ID 必须被正确设置!")
         return
+    if RSI_MODE not in VALID_RSI_MODES:
+        logger.warning(
+            f"RSI_MODE 配置无效: {RSI_MODE}，将回退为默认 'sma'。"
+        )
+        RSI_MODE = 'sma'
     logger.info("--- 机器人配置 ---")
     logger.info(f"RSI 周期: {RSI_PERIOD}")
     logger.info(f"历史数据天数: {HIST_FETCH_DAYS}")
