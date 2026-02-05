@@ -49,7 +49,6 @@
 | ----------------------------- | ---------------------------------- | ------ |
 | `CHECK_INTERVAL_SECONDS`      | 检查规则的间隔时间（秒）.          | `60`   |
 | `RSI_PERIOD`                  | 计算RSI指标的周期.                 | `6`    |
-| `RSI_MODE`                    | RSI计算模式: `sma`(默认), `wilder`, `ema`. | `sma` |
 | `USE_ADJUST`                  | 是否使用前复权价格 (`true`=是, `false`=否). | `true` |
 | `HIST_FETCH_DAYS`             | 获取用于计算RSI的历史数据的天数.   | `200`   |
 | `MAX_NOTIFICATIONS_PER_TRIGGER` | 单次触发区间内，发送通知的最大次数.| `1`    |

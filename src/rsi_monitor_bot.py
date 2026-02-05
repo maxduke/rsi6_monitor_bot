@@ -3,7 +3,6 @@
 import logging
 import sqlite3
 import pandas as pd
-import pandas_ta as ta
 import akshare as ak
 from datetime import datetime, time, timedelta
 import pytz
@@ -29,8 +28,6 @@ DB_FILE = os.getenv('DB_FILE', 'rules.db')
 
 # --- 监控参数配置 ---
 RSI_PERIOD = int(os.getenv('RSI_PERIOD', '6'))
-# [配置] 计算模式: 'sma'(默认,国内常用), 'wilder'(国际标准), 'ema'
-RSI_MODE = os.getenv('RSI_MODE', 'sma').lower() 
 # [配置] 是否复权: 'true'(默认,前复权), 'false'(不复权)
 USE_ADJUST = os.getenv('USE_ADJUST', 'true').lower() == 'true'
 # 历史数据获取天数
@@ -61,7 +58,6 @@ KEY_FAILURE_COUNT = 'fetch_failure_count'
 KEY_FAILURE_SENT = 'failure_notification_sent'
 STOCK_PREFIXES = ('0', '3', '6', '4', '8')
 ETF_PREFIXES = ('5', '1')
-VALID_RSI_MODES = {'sma', 'wilder', 'ema'}
 
 CHINA_CALENDAR = mcal.get_calendar('XSHG')
 
@@ -293,17 +289,39 @@ def get_prices_for_rsi(hist_df: pd.DataFrame, spot_price: float) -> Union[pd.Ser
         close_prices.iloc[-1] = float(spot_price)
     return close_prices
 
-def calculate_rsi(prices: pd.Series) -> Union[float, None]:
-    """从价格序列计算RSI (使用配置的模式)。"""
+def calculate_rsi_exact(prices: pd.Series, period: int = 6) -> Union[float, None]:
+    """
+    完全复刻同花顺/东财算法的 RSI 计算函数
+    使用 pandas 原生 ewm(alpha=1/N) 实现 Wilder 平滑
+    """
     try:
-        if len(prices) < RSI_PERIOD + 2: return None
-        # 使用环境变量配置的模式 (sma/wilder/ema)
-        rsi = ta.rsi(prices, length=RSI_PERIOD, mamode=RSI_MODE)
-        if rsi is None or rsi.empty: return None
+        if len(prices) < period + 1: return None
+        
+        # 1. 计算涨跌幅
+        delta = prices.diff()
+        
+        # 2. 分离涨跌
+        gain = delta.clip(lower=0)
+        loss = -1 * delta.clip(upper=0)
+        
+        # 3. 应用 Wilder 平滑 (alpha = 1/N)
+        # adjust=False 是关键，必须为 False 才能匹配国内软件
+        avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+        
+        # 4. 计算 RS 和 RSI
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        
+        # 返回最后一个值
         return round(rsi.iloc[-1], 2)
     except Exception as e:
-        logger.error(f"计算RSI时出错: {e}")
+        logger.error(f"RSI计算出错: {e}")
         return None
+
+def calculate_rsi(prices: pd.Series) -> Union[float, None]:
+    # 直接调用手动的精确算法，废弃pandas-ta
+    return calculate_rsi_exact(prices, period=RSI_PERIOD)
 
 # --- 市场时间检查 ---
 def is_trading_day(check_date: datetime) -> bool:
@@ -321,7 +339,7 @@ def is_market_hours() -> bool:
 @whitelisted_only
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    config_info = f"模式: {RSI_MODE.upper()} | 复权: {'是' if USE_ADJUST else '否'}"
+    config_info = f"复权: {'是' if USE_ADJUST else '否'}"
     await update.message.reply_html(f"你好, {user.mention_html()}!\n\n这是一个A股/ETF的RSI({RSI_PERIOD})监控机器人。\n({config_info})\n使用 /help 查看所有可用命令。")
 
 @whitelisted_only
@@ -350,7 +368,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 <b>全局配置:</b>
 - RSI 周期: <b>{RSI_PERIOD}</b>
-- 计算模式: <b>{RSI_MODE.upper()}</b> ({'复权' if USE_ADJUST else '不复权'})
+- 计算模式: ({'复权' if USE_ADJUST else '不复权'})
 - 请求间隔: <b>{REQUEST_INTERVAL_SECONDS}秒</b>
 - 每日简报主开关: <b>{'开启' if ENABLE_DAILY_BRIEFING else '关闭'} ({BRIEFING_TIMES_STR})</b>
     """
@@ -403,7 +421,7 @@ async def check_rsi_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rsi_value = calculate_rsi(prices)
         rsi_results[code] = f"{rsi_value:.2f}" if rsi_value is not None else "计算失败"
 
-    message = f"<b>📈 最新RSI值查询结果 ({RSI_MODE.upper()}):</b>\n\n"
+    message = f"<b>📈 最新RSI值查询结果:</b>\n\n"
     for code, code_rules in rules_by_code.items():
         asset_name = code_rules[0]['asset_name']
         rsi_val_str = rsi_results.get(code, "未查询")
@@ -723,19 +741,12 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def main():
     """主函数，用于启动机器人。"""
-    global RSI_MODE
     if not TELEGRAM_TOKEN or not ADMIN_USER_ID:
         logger.critical("错误: 环境变量 TELEGRAM_TOKEN 和 ADMIN_USER_ID 必须被正确设置!")
         return
-    if RSI_MODE not in VALID_RSI_MODES:
-        logger.warning(
-            f"RSI_MODE 配置无效: {RSI_MODE}，将回退为默认 'sma'。"
-        )
-        RSI_MODE = 'sma'
     logger.info("--- 机器人配置 ---")
     logger.info(f"RSI 周期: {RSI_PERIOD}")
     logger.info(f"历史数据天数: {HIST_FETCH_DAYS}")
-    logger.info(f"计算模式: {RSI_MODE.upper()}")
     logger.info(f"是否复权: {USE_ADJUST}")
     logger.info(f"最大通知次数/次: {MAX_NOTIFICATIONS_PER_TRIGGER}")
     logger.info(f"检查间隔: {CHECK_INTERVAL_SECONDS}秒")
