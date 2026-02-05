@@ -11,6 +11,7 @@ from functools import wraps
 from typing import Union, Dict, List, Tuple
 import os
 import random
+import requests
 import pandas_market_calendars as mcal
 from collections import defaultdict
 
@@ -43,6 +44,8 @@ ENABLE_DAILY_BRIEFING = os.getenv('ENABLE_DAILY_BRIEFING', 'false').lower() == '
 BRIEFING_TIMES_STR = os.getenv('DAILY_BRIEFING_TIMES', '15:30')
 FETCH_RETRY_ATTEMPTS = int(os.getenv('FETCH_RETRY_ATTEMPTS', '3'))
 FETCH_RETRY_DELAY_SECONDS = int(os.getenv('FETCH_RETRY_DELAY_SECONDS', '5'))
+EM_BLOCK_CHECK_INTERVAL_SECONDS = int(os.getenv('EM_BLOCK_CHECK_INTERVAL_SECONDS', '300'))
+EM_BLOCK_CHECK_URL = "https://i.eastmoney.com/websitecaptcha/api/checkuser?callback=wsc_checkuser"
 
 # --- 日志配置 ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -60,6 +63,7 @@ STOCK_PREFIXES = ('0', '3', '6', '4', '8')
 ETF_PREFIXES = ('5', '1')
 
 CHINA_CALENDAR = mcal.get_calendar('XSHG')
+EM_BLOCK_CACHE: Dict[str, Union[bool, datetime, None]] = {"blocked": None, "checked_at": None}
 
 
 # --- 数据库模块 ---
@@ -150,6 +154,29 @@ def get_sina_symbol(code: str) -> str:
     elif code.startswith(('4', '8')): return f"bj{code}"
     return code
 
+async def _is_em_blocked() -> bool:
+    now = datetime.now()
+    last_checked = EM_BLOCK_CACHE.get("checked_at")
+    if last_checked and (now - last_checked).total_seconds() < EM_BLOCK_CHECK_INTERVAL_SECONDS:
+        blocked = EM_BLOCK_CACHE.get("blocked")
+        return bool(blocked)
+
+    def fetch_status() -> bool:
+        try:
+            response = requests.get(EM_BLOCK_CHECK_URL, timeout=5)
+            text = response.text or ""
+            return '"block":true' in text or '"block": true' in text
+        except Exception as e:
+            logger.warning(f"检测东方财富封禁状态失败: {e}")
+            return False
+
+    blocked = await asyncio.to_thread(fetch_status)
+    EM_BLOCK_CACHE["blocked"] = blocked
+    EM_BLOCK_CACHE["checked_at"] = now
+    if blocked:
+        logger.warning("检测到东方财富接口被封禁，后续将直接使用新浪接口。")
+    return blocked
+
 async def get_asset_name_with_cache(asset_code: str, context: ContextTypes.DEFAULT_TYPE) -> str:
     name_cache = context.bot_data.get(KEY_NAME_CACHE, {})
     if asset_code in name_cache:
@@ -191,35 +218,88 @@ async def get_history_data(asset_code: str, days: int) -> Union[pd.DataFrame, No
         end_date = today.strftime('%Y%m%d')
         adjust = "qfq" if USE_ADJUST else ""
 
-        async def fetch_hist():
-            if asset_code.startswith(STOCK_PREFIXES):
-                return await asyncio.to_thread(
-                    ak.stock_zh_a_hist,
-                    symbol=asset_code,
-                    period="daily",
-                    start_date=start_date,
-                    end_date=end_date,
-                    adjust=adjust,
-                )
-            if asset_code.startswith(ETF_PREFIXES):
-                return await asyncio.to_thread(
-                    ak.fund_etf_hist_em,
-                    symbol=asset_code,
-                    period="daily",
-                    start_date=start_date,
-                    end_date=end_date,
-                    adjust=adjust,
-                )
+        def _normalize_hist_df(hist_df: pd.DataFrame) -> pd.DataFrame:
+            if hist_df is None or hist_df.empty:
+                return hist_df
+            rename_map = {
+                "date": "日期",
+                "open": "开盘",
+                "high": "最高",
+                "low": "最低",
+                "close": "收盘",
+                "volume": "成交量",
+                "amount": "成交额",
+            }
+            hist_df = hist_df.rename(columns={k: v for k, v in rename_map.items() if k in hist_df.columns})
+            if "日期" in hist_df.columns:
+                hist_df["日期"] = pd.to_datetime(hist_df["日期"])
+            return hist_df
+
+        async def fetch_hist_em():
+            try:
+                if asset_code.startswith(STOCK_PREFIXES):
+                    return await asyncio.to_thread(
+                        ak.stock_zh_a_hist,
+                        symbol=asset_code,
+                        period="daily",
+                        start_date=start_date,
+                        end_date=end_date,
+                        adjust=adjust,
+                    )
+                if asset_code.startswith(ETF_PREFIXES):
+                    return await asyncio.to_thread(
+                        ak.fund_etf_hist_em,
+                        symbol=asset_code,
+                        period="daily",
+                        start_date=start_date,
+                        end_date=end_date,
+                        adjust=adjust,
+                    )
+            except Exception as e:
+                logger.warning(f"东方财富接口获取历史数据失败({asset_code}): {e}")
             return None
 
-        df = await _run_with_retries(fetch_hist, f"获取历史数据({asset_code})")
+        async def fetch_hist_sina():
+            try:
+                sina_symbol = get_sina_symbol(asset_code)
+                if asset_code.startswith(STOCK_PREFIXES):
+                    return await asyncio.to_thread(
+                        ak.stock_zh_a_daily,
+                        symbol=sina_symbol,
+                        start_date=start_date,
+                        end_date=end_date,
+                        adjust=adjust,
+                    )
+                if asset_code.startswith(ETF_PREFIXES):
+                    return await asyncio.to_thread(
+                        ak.fund_etf_hist_sina,
+                        symbol=sina_symbol,
+                    )
+            except Exception as e:
+                logger.warning(f"新浪接口获取历史数据失败({asset_code}): {e}")
+            return None
+
+        use_em = not await _is_em_blocked()
+        df = None
+        source = "sina"
+        if use_em:
+            df = await _run_with_retries(fetch_hist_em, f"获取历史数据({asset_code})")
+            source = "em"
+        if df is None or (df is not None and df.empty):
+            logger.info(f"尝试使用新浪接口获取历史数据({asset_code})。")
+            df = await _run_with_retries(fetch_hist_sina, f"获取历史数据-新浪({asset_code})")
+            source = "sina"
         if df is None:
             return None
-        if df is not None and not df.empty:
-            df['日期'] = pd.to_datetime(df['日期'])
-            df.set_index('日期', inplace=True)
+        df = _normalize_hist_df(df)
+        if df is not None and not df.empty and "日期" in df.columns:
+            df.set_index("日期", inplace=True)
             if USE_ADJUST:
-                df.attrs['adjust_factor'] = await _get_adjust_factor(asset_code, df)
+                if source == "sina" and asset_code.startswith(ETF_PREFIXES):
+                    logger.info(f"ETF({asset_code}) 使用新浪历史数据，仅能提供不复权数据。")
+                    df.attrs["adjust_factor"] = 1.0
+                else:
+                    df.attrs['adjust_factor'] = await _get_adjust_factor(asset_code, df)
         return df
     except Exception as e:
         logger.error(f"获取 {asset_code} 历史数据失败: {e}")
@@ -238,31 +318,79 @@ async def _get_adjust_factor(asset_code: str, hist_df: pd.DataFrame) -> float:
         raw_start = (base_date - timedelta(days=30)).strftime('%Y%m%d')
         raw_end = (base_date + timedelta(days=1)).strftime('%Y%m%d')
 
-        async def fetch_raw_hist():
-            if asset_code.startswith(STOCK_PREFIXES):
-                return await asyncio.to_thread(
-                    ak.stock_zh_a_hist,
-                    symbol=asset_code,
-                    period="daily",
-                    start_date=raw_start,
-                    end_date=raw_end,
-                    adjust="",
-                )
-            if asset_code.startswith(ETF_PREFIXES):
-                return await asyncio.to_thread(
-                    ak.fund_etf_hist_em,
-                    symbol=asset_code,
-                    period="daily",
-                    start_date=raw_start,
-                    end_date=raw_end,
-                    adjust="",
-                )
+        def _normalize_hist_df(hist_df: pd.DataFrame) -> pd.DataFrame:
+            if hist_df is None or hist_df.empty:
+                return hist_df
+            rename_map = {
+                "date": "日期",
+                "open": "开盘",
+                "high": "最高",
+                "low": "最低",
+                "close": "收盘",
+                "volume": "成交量",
+                "amount": "成交额",
+            }
+            hist_df = hist_df.rename(columns={k: v for k, v in rename_map.items() if k in hist_df.columns})
+            if "日期" in hist_df.columns:
+                hist_df["日期"] = pd.to_datetime(hist_df["日期"])
+            return hist_df
+
+        async def fetch_raw_hist_em():
+            try:
+                if asset_code.startswith(STOCK_PREFIXES):
+                    return await asyncio.to_thread(
+                        ak.stock_zh_a_hist,
+                        symbol=asset_code,
+                        period="daily",
+                        start_date=raw_start,
+                        end_date=raw_end,
+                        adjust="",
+                    )
+                if asset_code.startswith(ETF_PREFIXES):
+                    return await asyncio.to_thread(
+                        ak.fund_etf_hist_em,
+                        symbol=asset_code,
+                        period="daily",
+                        start_date=raw_start,
+                        end_date=raw_end,
+                        adjust="",
+                    )
+            except Exception as e:
+                logger.warning(f"东方财富接口获取未复权数据失败({asset_code}): {e}")
             return None
 
-        raw_df = await _run_with_retries(fetch_raw_hist, f"获取未复权数据({asset_code})")
+        async def fetch_raw_hist_sina():
+            try:
+                sina_symbol = get_sina_symbol(asset_code)
+                if asset_code.startswith(STOCK_PREFIXES):
+                    return await asyncio.to_thread(
+                        ak.stock_zh_a_daily,
+                        symbol=sina_symbol,
+                        start_date=raw_start,
+                        end_date=raw_end,
+                        adjust="",
+                    )
+                if asset_code.startswith(ETF_PREFIXES):
+                    return await asyncio.to_thread(
+                        ak.fund_etf_hist_sina,
+                        symbol=sina_symbol,
+                    )
+            except Exception as e:
+                logger.warning(f"新浪接口获取未复权数据失败({asset_code}): {e}")
+            return None
+
+        use_em = not await _is_em_blocked()
+        raw_df = None
+        if use_em:
+            raw_df = await _run_with_retries(fetch_raw_hist_em, f"获取未复权数据({asset_code})")
+        if raw_df is None or raw_df.empty:
+            logger.info(f"尝试使用新浪接口获取未复权数据({asset_code})。")
+            raw_df = await _run_with_retries(fetch_raw_hist_sina, f"获取未复权数据-新浪({asset_code})")
         if raw_df is None or raw_df.empty:
             return 1.0
-        raw_df['日期'] = pd.to_datetime(raw_df['日期'])
+        raw_df = _normalize_hist_df(raw_df)
+        if raw_df is None or raw_df.empty or "日期" not in raw_df.columns:
+            return 1.0
         raw_df.set_index('日期', inplace=True)
         if base_date not in raw_df.index or base_date not in hist_df.index:
             return 1.0
