@@ -184,7 +184,7 @@ async def get_asset_name_with_cache(asset_code: str, context: ContextTypes.DEFAU
     return name
 
 async def get_history_data(asset_code: str, days: int) -> Union[pd.DataFrame, None]:
-    """获取单个资产的历史日线数据。"""
+    """获取单个资产的历史日线数据，并在需要时计算复权因子。"""
     try:
         today = datetime.now()
         start_date = (today - timedelta(days=days)).strftime('%Y%m%d')
@@ -218,10 +218,71 @@ async def get_history_data(asset_code: str, days: int) -> Union[pd.DataFrame, No
         if df is not None and not df.empty:
             df['日期'] = pd.to_datetime(df['日期'])
             df.set_index('日期', inplace=True)
+            if USE_ADJUST:
+                df.attrs['adjust_factor'] = await _get_adjust_factor(asset_code, df)
         return df
     except Exception as e:
         logger.error(f"获取 {asset_code} 历史数据失败: {e}")
         return None
+
+async def _get_adjust_factor(asset_code: str, hist_df: pd.DataFrame) -> float:
+    """
+    计算复权因子（复权收盘 / 未复权收盘），用于将实时价格转换到复权尺度。
+    若无法计算，则返回 1.0。
+    """
+    try:
+        base_date = hist_df.index[-1]
+        today_date = datetime.now(pytz.timezone('Asia/Shanghai')).date()
+        if base_date.date() >= today_date and len(hist_df.index) > 1:
+            base_date = hist_df.index[-2]
+        raw_start = (base_date - timedelta(days=30)).strftime('%Y%m%d')
+        raw_end = (base_date + timedelta(days=1)).strftime('%Y%m%d')
+
+        async def fetch_raw_hist():
+            if asset_code.startswith(STOCK_PREFIXES):
+                return await asyncio.to_thread(
+                    ak.stock_zh_a_hist,
+                    symbol=asset_code,
+                    period="daily",
+                    start_date=raw_start,
+                    end_date=raw_end,
+                    adjust="",
+                )
+            if asset_code.startswith(ETF_PREFIXES):
+                return await asyncio.to_thread(
+                    ak.fund_etf_hist_em,
+                    symbol=asset_code,
+                    period="daily",
+                    start_date=raw_start,
+                    end_date=raw_end,
+                    adjust="",
+                )
+            return None
+
+        raw_df = await _run_with_retries(fetch_raw_hist, f"获取未复权数据({asset_code})")
+        if raw_df is None or raw_df.empty:
+            return 1.0
+        raw_df['日期'] = pd.to_datetime(raw_df['日期'])
+        raw_df.set_index('日期', inplace=True)
+        if base_date not in raw_df.index or base_date not in hist_df.index:
+            return 1.0
+        raw_close = raw_df.loc[base_date, '收盘']
+        if raw_close is None or raw_close == 0:
+            return 1.0
+        adjusted_close = hist_df.loc[base_date, '收盘']
+        return float(adjusted_close) / float(raw_close)
+    except Exception as e:
+        logger.warning(f"计算复权因子失败({asset_code}): {e}")
+        return 1.0
+
+def _adjust_spot_price(hist_df: pd.DataFrame, spot_price: float) -> float:
+    """将实时价格调整到与历史复权数据一致的价格尺度。"""
+    if not USE_ADJUST:
+        return float(spot_price)
+    adjust_factor = hist_df.attrs.get('adjust_factor')
+    if not adjust_factor or adjust_factor == 0:
+        return float(spot_price)
+    return float(spot_price) * float(adjust_factor)
 
 async def _fetch_single_realtime_price(code: str) -> Union[float, None]:
     """通过新浪分时接口获取最新价 (最稳健)"""
@@ -276,23 +337,25 @@ async def _fetch_all_spot_data(context: ContextTypes.DEFAULT_TYPE, codes: List[s
 
 
 def get_prices_for_rsi(hist_df: pd.DataFrame, spot_price: float) -> Union[pd.Series, None]:
-    """根据历史和实时价格准备用于RSI计算的价格序列。"""
+    """根据历史和实时价格准备用于 RSI 计算的价格序列。"""
     if hist_df is None or hist_df.empty: return None
     if '收盘' not in hist_df.columns: return None
     close_prices = hist_df['收盘'].copy()
     last_date_in_hist = close_prices.index[-1].date()
     today_date = datetime.now(pytz.timezone('Asia/Shanghai')).date()
-    # 关键逻辑：确保最后一行是当前的 spot_price
+    adjusted_spot_price = _adjust_spot_price(hist_df, spot_price)
+    # 关键逻辑：确保最后一行是当前价格，用于实时 RSI 计算。
     if last_date_in_hist < today_date:
-        close_prices.loc[pd.Timestamp(today_date)] = spot_price
+        close_prices.loc[pd.Timestamp(today_date)] = adjusted_spot_price
     else:
-        close_prices.iloc[-1] = float(spot_price)
+        close_prices.iloc[-1] = adjusted_spot_price
     return close_prices
 
 def calculate_rsi_exact(prices: pd.Series, period: int = 6) -> Union[float, None]:
     """
-    完全复刻同花顺/东财算法的 RSI 计算函数
-    使用 pandas 原生 ewm(alpha=1/N) 实现 Wilder 平滑
+    完全复刻同花顺/东财算法的 RSI 计算函数。
+    注意：prices 应当已处于目标价格尺度（复权或未复权）。
+    使用 pandas 原生 ewm(alpha=1/N) 实现 Wilder 平滑。
     """
     try:
         if len(prices) < period + 1: return None
@@ -305,9 +368,9 @@ def calculate_rsi_exact(prices: pd.Series, period: int = 6) -> Union[float, None
         loss = -1 * delta.clip(upper=0)
         
         # 3. 应用 Wilder 平滑 (alpha = 1/N)
-        # adjust=False 是关键，必须为 False 才能匹配国内软件
-        avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
-        avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+        # 同花顺口径：ewm 使用 adjust=True。
+        avg_gain = gain.ewm(alpha=1/period, adjust=True).mean()
+        avg_loss = loss.ewm(alpha=1/period, adjust=True).mean()
         
         # 4. 计算 RS 和 RSI
         rs = avg_gain / avg_loss
