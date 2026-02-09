@@ -361,8 +361,8 @@ async def _get_adjust_factor(asset_code: str, hist_df: pd.DataFrame) -> float:
 
         async def fetch_raw_hist_sina():
             try:
-                sina_symbol = get_sina_symbol(asset_code)
                 if asset_code.startswith(STOCK_PREFIXES):
+                    sina_symbol = get_sina_symbol(asset_code)
                     return await asyncio.to_thread(
                         ak.stock_zh_a_daily,
                         symbol=sina_symbol,
@@ -371,6 +371,7 @@ async def _get_adjust_factor(asset_code: str, hist_df: pd.DataFrame) -> float:
                         adjust="",
                     )
                 if asset_code.startswith(ETF_PREFIXES):
+                    sina_symbol = get_sina_symbol(asset_code)
                     return await asyncio.to_thread(
                         ak.fund_etf_hist_sina,
                         symbol=sina_symbol,
@@ -381,9 +382,18 @@ async def _get_adjust_factor(asset_code: str, hist_df: pd.DataFrame) -> float:
 
         use_em = not await _is_em_blocked()
         raw_df = None
-        if use_em:
+        sina_attempted = False
+
+        # ETF 在复权模式下，优先用新浪获取未复权价格序列，以减少东方财富请求次数。
+        prefer_sina_for_etf_raw = USE_ADJUST and asset_code.startswith(ETF_PREFIXES)
+        if prefer_sina_for_etf_raw:
+            sina_attempted = True
+            raw_df = await _run_with_retries(fetch_raw_hist_sina, f"获取未复权数据-新浪({asset_code})")
+
+        if (raw_df is None or raw_df.empty) and use_em:
             raw_df = await _run_with_retries(fetch_raw_hist_em, f"获取未复权数据({asset_code})")
-        if raw_df is None or raw_df.empty:
+
+        if (raw_df is None or raw_df.empty) and not sina_attempted:
             logger.info(f"尝试使用新浪接口获取未复权数据({asset_code})。")
             raw_df = await _run_with_retries(fetch_raw_hist_sina, f"获取未复权数据-新浪({asset_code})")
         if raw_df is None or raw_df.empty:
@@ -392,12 +402,21 @@ async def _get_adjust_factor(asset_code: str, hist_df: pd.DataFrame) -> float:
         if raw_df is None or raw_df.empty or "日期" not in raw_df.columns:
             return 1.0
         raw_df.set_index('日期', inplace=True)
-        if base_date not in raw_df.index or base_date not in hist_df.index:
+
+        # 日期对齐：优先使用 base_date；若不存在则使用两侧都存在且不晚于 base_date 的最近交易日。
+        base_ts = pd.Timestamp(base_date)
+        raw_idx = pd.to_datetime(raw_df.index)
+        adj_idx = pd.to_datetime(hist_df.index)
+        common_dates = raw_idx.intersection(adj_idx)
+        candidate_dates = common_dates[common_dates <= base_ts]
+        if candidate_dates.empty:
             return 1.0
-        raw_close = raw_df.loc[base_date, '收盘']
+        aligned_date = candidate_dates.max()
+
+        raw_close = raw_df.loc[aligned_date, '收盘']
         if raw_close is None or raw_close == 0:
             return 1.0
-        adjusted_close = hist_df.loc[base_date, '收盘']
+        adjusted_close = hist_df.loc[aligned_date, '收盘']
         return float(adjusted_close) / float(raw_close)
     except Exception as e:
         logger.warning(f"计算复权因子失败({asset_code}): {e}")
