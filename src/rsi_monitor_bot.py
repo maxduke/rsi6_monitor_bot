@@ -87,7 +87,7 @@ def db_init():
         conn.commit()
         logger.info("数据库初始化完成。")
 
-def db_execute(query, params=(), fetchone=False, fetchall=False):
+def db_execute(query, params=(), fetchone=False, fetchall=False, swallow_errors=True):
     try:
         with sqlite3.connect(DB_FILE) as conn:
             conn.row_factory = sqlite3.Row
@@ -99,6 +99,8 @@ def db_execute(query, params=(), fetchone=False, fetchall=False):
             return None
     except sqlite3.Error as e:
         logger.error(f"数据库操作失败: {e}")
+        if not swallow_errors:
+            raise
         return None
 
 # --- 白名单与装饰器 ---
@@ -473,7 +475,8 @@ async def _fetch_all_spot_data(context: ContextTypes.DEFAULT_TYPE, codes: List[s
                 await context.bot.send_message(chat_id=ADMIN_USER_ID, text=admin_message, parse_mode=ParseMode.MARKDOWN)
                 logger.warning(f"已向管理员发送数据获取失败的警报通知。")
                 context.bot_data[KEY_FAILURE_SENT] = True
-            except: pass
+            except Exception as e:
+                logger.error(f"向管理员发送数据获取失败告警时出错: {e}")
         return {}, False
     
     # 成功获取，重置失败计数器
@@ -674,6 +677,9 @@ async def add_rule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if rsi_min >= rsi_max:
             await update.message.reply_text("错误：RSI最小值必须小于最大值。")
             return
+        if rsi_min < 0 or rsi_max > 100:
+            await update.message.reply_text("错误：RSI区间必须在 0 到 100 之间。")
+            return
         sent_message = await update.message.reply_text(f"正在验证代码 {asset_code}...")
         
         # 验证代码有效性
@@ -684,7 +690,11 @@ async def add_rule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         asset_name = await get_asset_name_with_cache(asset_code, context)
         try:
-            db_execute("INSERT INTO rules (user_id, asset_code, asset_name, rsi_min, rsi_max) VALUES (?, ?, ?, ?, ?)", (user_id, asset_code, asset_name, rsi_min, rsi_max))
+            db_execute(
+                "INSERT INTO rules (user_id, asset_code, asset_name, rsi_min, rsi_max) VALUES (?, ?, ?, ?, ?)",
+                (user_id, asset_code, asset_name, rsi_min, rsi_max),
+                swallow_errors=False,
+            )
             await sent_message.edit_text(f"✅ 规则已添加:\n[{asset_name}({asset_code})] RSI区间: {rsi_min}-{rsi_max}")
         except sqlite3.IntegrityError:
             await sent_message.edit_text(f"❌ 错误：完全相同的规则 (代码和RSI区间) 已存在。")
