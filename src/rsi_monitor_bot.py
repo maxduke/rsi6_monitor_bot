@@ -64,6 +64,7 @@ ETF_PREFIXES = ('5', '1')
 
 CHINA_CALENDAR = mcal.get_calendar('XSHG')
 EM_BLOCK_CACHE: Dict[str, Union[bool, datetime, None]] = {"blocked": None, "checked_at": None}
+TRADE_DAY_CACHE: Dict[str, Union[set, datetime, None]] = {"days": None, "loaded_at": None}
 
 
 # --- 数据库模块 ---
@@ -537,8 +538,39 @@ def calculate_rsi(prices: pd.Series) -> Union[float, None]:
     return calculate_rsi_exact(prices, period=RSI_PERIOD)
 
 # --- 市场时间检查 ---
+def _load_trade_days_from_ak() -> Union[set, None]:
+    try:
+        df = ak.tool_trade_date_hist_sina()
+        if df is None or df.empty:
+            return None
+        date_col = 'trade_date' if 'trade_date' in df.columns else '日期'
+        if date_col not in df.columns:
+            return None
+        return set(pd.to_datetime(df[date_col]).dt.date.tolist())
+    except Exception as e:
+        logger.warning(f"从 AKShare 获取交易日历失败，将回退到本地交易所日历: {e}")
+        return None
+
 def is_trading_day(check_date: datetime) -> bool:
-    return not CHINA_CALENDAR.valid_days(start_date=check_date.date(), end_date=check_date.date()).empty
+    cn_date = check_date.date()
+    today_cn = datetime.now(pytz.timezone('Asia/Shanghai')).date()
+
+    # 优先使用 AKShare 提供的交易日（对当年节假日更准确），每天最多刷新一次
+    loaded_at = TRADE_DAY_CACHE.get("loaded_at")
+    need_refresh = not loaded_at or loaded_at.date() != today_cn
+    if need_refresh:
+        trade_days = _load_trade_days_from_ak()
+        if trade_days is not None:
+            TRADE_DAY_CACHE["days"] = trade_days
+            TRADE_DAY_CACHE["loaded_at"] = datetime.now()
+
+    trade_days_cache = TRADE_DAY_CACHE.get("days")
+    if isinstance(trade_days_cache, set) and cn_date <= today_cn:
+        return cn_date in trade_days_cache
+
+    # 对未来日期或 AKShare 不可用场景，回退到 pandas_market_calendars
+    return not CHINA_CALENDAR.valid_days(start_date=cn_date, end_date=cn_date).empty
+
 def is_market_hours() -> bool:
     tz = pytz.timezone('Asia/Shanghai')
     now = datetime.now(tz)
