@@ -18,7 +18,7 @@ from collections import defaultdict
 from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
-from telegram.error import Forbidden
+from telegram.error import Forbidden, RetryAfter
 
 # --- 机器人配置 (从环境变量读取) ---
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
@@ -856,35 +856,77 @@ async def check_rules_job(context: ContextTypes.DEFAULT_TYPE):
     spot_data, success = await _fetch_all_spot_data(context, list(all_codes))
     if not success: return
 
-    for rule in active_rules:
-        asset_code = rule['asset_code']
-        hist_df = hist_data_cache.get(asset_code)
-        spot_price = spot_data.get(asset_code)
-        if hist_df is None or spot_price is None: continue
-        
+    rsi_by_code: Dict[str, float] = {}
+    for code in all_codes:
+        hist_df = hist_data_cache.get(code)
+        spot_price = spot_data.get(code)
+        if hist_df is None or spot_price is None:
+            continue
         prices = get_prices_for_rsi(hist_df, spot_price)
         current_rsi = calculate_rsi(prices)
-        if current_rsi is None: continue
+        if current_rsi is not None:
+            rsi_by_code[code] = current_rsi
+
+    pending_notifications: Dict[int, List[Tuple[sqlite3.Row, float]]] = defaultdict(list)
+    for rule in active_rules:
+        asset_code = rule['asset_code']
+        current_rsi = rsi_by_code.get(asset_code)
+        if current_rsi is None:
+            continue
 
         logger.debug(f"检查: {rule['asset_name']}({asset_code}) | RSI({RSI_PERIOD}): {current_rsi}")
         is_triggered = rule['rsi_min'] <= current_rsi <= rule['rsi_max']
         last_notified_rsi_in_range = rule['rsi_min'] <= rule['last_notified_rsi'] <= rule['rsi_max']
-        
+
         if is_triggered and rule['notification_count'] < MAX_NOTIFICATIONS_PER_TRIGGER:
-            message = (f"🎯 <b>RSI 警报 ({rule['notification_count'] + 1}/{MAX_NOTIFICATIONS_PER_TRIGGER})</b> 🎯\n\n"
-                       f"<b>{rule['asset_name']} ({rule['asset_code']})</b>\n\n"
-                       f"当前 RSI({RSI_PERIOD}): <b>{current_rsi:.2f}</b>\n已进入目标区间: <code>{rule['rsi_min']} - {rule['rsi_max']}</code>")
-            try:
-                await context.bot.send_message(chat_id=rule['user_id'], text=message, parse_mode=ParseMode.HTML)
-                logger.info(f"已发送通知: {asset_code} | 用户: {rule['user_id']} | (第 {rule['notification_count'] + 1} 次)")
-                db_execute("UPDATE rules SET last_notified_rsi = ?, notification_count = notification_count + 1 WHERE id = ?", (current_rsi, rule['id']))
-            except Exception as e:
-                logger.error(f"向用户 {rule['user_id']} 发送通知失败: {e}")
-        elif not is_triggered and last_notified_rsi_in_range:
-             logger.info(f"离开区间: {asset_code} | 重置通知计数器。")
-             db_execute("UPDATE rules SET last_notified_rsi = ?, notification_count = 0 WHERE id = ?", (current_rsi, rule['id']))
+            pending_notifications[rule['user_id']].append((rule, current_rsi))
+            continue
+
+        if not is_triggered and last_notified_rsi_in_range:
+            logger.info(f"离开区间: {asset_code} | 重置通知计数器。")
+            db_execute(
+                "UPDATE rules SET last_notified_rsi = ?, notification_count = 0 WHERE id = ?",
+                (current_rsi, rule['id'])
+            )
         elif is_triggered:
             db_execute("UPDATE rules SET last_notified_rsi = ? WHERE id = ?", (current_rsi, rule['id']))
+
+    for user_id, triggered_rules in pending_notifications.items():
+        lines = [f"🎯 <b>RSI 警报汇总</b> 🎯", ""]
+        for rule, current_rsi in triggered_rules:
+            lines.append(
+                f"• <b>{rule['asset_name']} ({rule['asset_code']})</b>\n"
+                f"  RSI({RSI_PERIOD}): <b>{current_rsi:.2f}</b>\n"
+                f"  目标区间: <code>{rule['rsi_min']} - {rule['rsi_max']}</code>\n"
+                f"  通知次数: <b>{rule['notification_count'] + 1}/{MAX_NOTIFICATIONS_PER_TRIGGER}</b>"
+            )
+            lines.append("")
+        message = "\n".join(lines).strip()
+
+        sent = False
+        for attempt in range(2):
+            try:
+                await context.bot.send_message(chat_id=user_id, text=message, parse_mode=ParseMode.HTML)
+                sent = True
+                break
+            except RetryAfter as e:
+                wait_seconds = int(getattr(e, "retry_after", 1)) + 1
+                logger.warning(f"发送通知触发限流，{wait_seconds}秒后重试。用户: {user_id}")
+                await asyncio.sleep(wait_seconds)
+            except Exception as e:
+                logger.error(f"向用户 {user_id} 发送通知失败: {e}")
+                break
+
+        if sent:
+            for rule, current_rsi in triggered_rules:
+                logger.info(
+                    f"已发送通知: {rule['asset_code']} | 用户: {user_id} | "
+                    f"(第 {rule['notification_count'] + 1} 次)"
+                )
+                db_execute(
+                    "UPDATE rules SET last_notified_rsi = ?, notification_count = notification_count + 1 WHERE id = ?",
+                    (current_rsi, rule['id'])
+                )
 
 async def daily_briefing_job(context: ContextTypes.DEFAULT_TYPE):
     if not ENABLE_DAILY_BRIEFING: return
