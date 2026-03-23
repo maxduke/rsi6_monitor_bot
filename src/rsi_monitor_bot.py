@@ -4,6 +4,8 @@ import logging
 import sqlite3
 import pandas as pd
 import akshare as ak
+import html
+import math
 from datetime import datetime, time, timedelta
 import pytz
 import asyncio
@@ -867,6 +869,52 @@ async def check_rules_job(context: ContextTypes.DEFAULT_TYPE):
         if current_rsi is not None:
             rsi_by_code[code] = current_rsi
 
+    def _in_range(rsi_value: Union[float, int, None], rsi_min: float, rsi_max: float) -> bool:
+        if rsi_value is None:
+            return False
+        try:
+            value = float(rsi_value)
+            if math.isnan(value):
+                return False
+            return rsi_min <= value <= rsi_max
+        except (TypeError, ValueError):
+            return False
+
+    def _build_notification_chunks(
+        rules_for_user: List[Tuple[sqlite3.Row, float]],
+        max_len: int = 3500
+    ) -> List[Tuple[str, List[Tuple[sqlite3.Row, float]]]]:
+        """
+        将单用户触发规则分块，避免 Telegram 4096 字符上限导致整条消息发送失败。
+        每个 chunk 返回 (message, 对应规则列表)。
+        """
+        header = "🎯 <b>RSI 警报汇总</b> 🎯\n\n"
+        chunks: List[Tuple[str, List[Tuple[sqlite3.Row, float]]]] = []
+        current_parts: List[str] = [header]
+        current_rules: List[Tuple[sqlite3.Row, float]] = []
+
+        for rule, current_rsi in rules_for_user:
+            safe_asset_name = html.escape(str(rule['asset_name'] or "未知资产"))
+            section = (
+                f"• <b>{safe_asset_name} ({rule['asset_code']})</b>\n"
+                f"  RSI({RSI_PERIOD}): <b>{current_rsi:.2f}</b>\n"
+                f"  目标区间: <code>{rule['rsi_min']} - {rule['rsi_max']}</code>\n"
+                f"  通知次数: <b>{rule['notification_count'] + 1}/{MAX_NOTIFICATIONS_PER_TRIGGER}</b>\n\n"
+            )
+
+            tentative = "".join(current_parts) + section
+            if len(tentative) > max_len and current_rules:
+                chunks.append(("".join(current_parts).strip(), current_rules.copy()))
+                current_parts = [header, section]
+                current_rules = [(rule, current_rsi)]
+            else:
+                current_parts.append(section)
+                current_rules.append((rule, current_rsi))
+
+        if current_rules:
+            chunks.append(("".join(current_parts).strip(), current_rules.copy()))
+        return chunks
+
     pending_notifications: Dict[int, List[Tuple[sqlite3.Row, float]]] = defaultdict(list)
     for rule in active_rules:
         asset_code = rule['asset_code']
@@ -875,8 +923,8 @@ async def check_rules_job(context: ContextTypes.DEFAULT_TYPE):
             continue
 
         logger.debug(f"检查: {rule['asset_name']}({asset_code}) | RSI({RSI_PERIOD}): {current_rsi}")
-        is_triggered = rule['rsi_min'] <= current_rsi <= rule['rsi_max']
-        last_notified_rsi_in_range = rule['rsi_min'] <= rule['last_notified_rsi'] <= rule['rsi_max']
+        is_triggered = _in_range(current_rsi, rule['rsi_min'], rule['rsi_max'])
+        last_notified_rsi_in_range = _in_range(rule['last_notified_rsi'], rule['rsi_min'], rule['rsi_max'])
 
         if is_triggered and rule['notification_count'] < MAX_NOTIFICATIONS_PER_TRIGGER:
             pending_notifications[rule['user_id']].append((rule, current_rsi))
@@ -892,41 +940,36 @@ async def check_rules_job(context: ContextTypes.DEFAULT_TYPE):
             db_execute("UPDATE rules SET last_notified_rsi = ? WHERE id = ?", (current_rsi, rule['id']))
 
     for user_id, triggered_rules in pending_notifications.items():
-        lines = [f"🎯 <b>RSI 警报汇总</b> 🎯", ""]
-        for rule, current_rsi in triggered_rules:
-            lines.append(
-                f"• <b>{rule['asset_name']} ({rule['asset_code']})</b>\n"
-                f"  RSI({RSI_PERIOD}): <b>{current_rsi:.2f}</b>\n"
-                f"  目标区间: <code>{rule['rsi_min']} - {rule['rsi_max']}</code>\n"
-                f"  通知次数: <b>{rule['notification_count'] + 1}/{MAX_NOTIFICATIONS_PER_TRIGGER}</b>"
-            )
-            lines.append("")
-        message = "\n".join(lines).strip()
+        triggered_rules_sorted = sorted(
+            triggered_rules,
+            key=lambda item: (item[0]['asset_code'], item[0]['rsi_min'], item[0]['rsi_max'], item[0]['id'])
+        )
+        message_chunks = _build_notification_chunks(triggered_rules_sorted)
+        for message, rules_in_chunk in message_chunks:
+            sent = False
+            for _ in range(2):
+                try:
+                    await context.bot.send_message(chat_id=user_id, text=message, parse_mode=ParseMode.HTML)
+                    sent = True
+                    break
+                except RetryAfter as e:
+                    wait_seconds = int(getattr(e, "retry_after", 1)) + 1
+                    logger.warning(f"发送通知触发限流，{wait_seconds}秒后重试。用户: {user_id}")
+                    await asyncio.sleep(wait_seconds)
+                except Exception as e:
+                    logger.error(f"向用户 {user_id} 发送通知失败: {e}")
+                    break
 
-        sent = False
-        for attempt in range(2):
-            try:
-                await context.bot.send_message(chat_id=user_id, text=message, parse_mode=ParseMode.HTML)
-                sent = True
-                break
-            except RetryAfter as e:
-                wait_seconds = int(getattr(e, "retry_after", 1)) + 1
-                logger.warning(f"发送通知触发限流，{wait_seconds}秒后重试。用户: {user_id}")
-                await asyncio.sleep(wait_seconds)
-            except Exception as e:
-                logger.error(f"向用户 {user_id} 发送通知失败: {e}")
-                break
-
-        if sent:
-            for rule, current_rsi in triggered_rules:
-                logger.info(
-                    f"已发送通知: {rule['asset_code']} | 用户: {user_id} | "
-                    f"(第 {rule['notification_count'] + 1} 次)"
-                )
-                db_execute(
-                    "UPDATE rules SET last_notified_rsi = ?, notification_count = notification_count + 1 WHERE id = ?",
-                    (current_rsi, rule['id'])
-                )
+            if sent:
+                for rule, current_rsi in rules_in_chunk:
+                    logger.info(
+                        f"已发送通知: {rule['asset_code']} | 用户: {user_id} | "
+                        f"(第 {rule['notification_count'] + 1} 次)"
+                    )
+                    db_execute(
+                        "UPDATE rules SET last_notified_rsi = ?, notification_count = notification_count + 1 WHERE id = ?",
+                        (current_rsi, rule['id'])
+                    )
 
 async def daily_briefing_job(context: ContextTypes.DEFAULT_TYPE):
     if not ENABLE_DAILY_BRIEFING: return
