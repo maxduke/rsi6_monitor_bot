@@ -6,7 +6,7 @@
 #
 akracer==0.0.14
     # via akshare
-akshare==1.18.51
+akshare==1.18.55
     # via -r requirements.in
 anyio==4.11.0
     # via httpx
