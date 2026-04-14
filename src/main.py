@@ -32,6 +32,7 @@ from .handlers import (
     help_command,
     list_rules_command,
     list_whitelist_command,
+    refresh_cache_command,
     start_command,
     toggle_rule_status_command,
 )
@@ -99,6 +100,7 @@ def main():
         CommandHandler("add_w", add_whitelist_command),
         CommandHandler("del_w", del_whitelist_command),
         CommandHandler("list_w", list_whitelist_command),
+        CommandHandler("refresh", refresh_cache_command),
     ]
     application.add_handlers(handlers)
 

@@ -13,6 +13,7 @@ from .config import (
     ADMIN_USER_ID,
     ENABLE_DAILY_BRIEFING,
     BRIEFING_TIMES_STR,
+    KEY_CACHE_DATE,
     KEY_HIST_CACHE,
     MAX_NOTIFICATIONS_PER_TRIGGER,
     REQUEST_INTERVAL_SECONDS,
@@ -292,7 +293,13 @@ async def toggle_rule_status_command(update: Update, context: ContextTypes.DEFAU
         if not rule:
             await update.message.reply_text(f"错误：未找到ID为 {rule_id} 的规则，或该规则不属于您。")
             return
-        db_execute("UPDATE rules SET is_active = ? WHERE id = ? AND user_id = ?", (new_status, rule_id, user_id))
+        if new_status == 1:
+            db_execute(
+                "UPDATE rules SET is_active = 1, notification_count = 0, last_notified_rsi = 0 WHERE id = ? AND user_id = ?",
+                (rule_id, user_id),
+            )
+        else:
+            db_execute("UPDATE rules SET is_active = 0 WHERE id = ? AND user_id = ?", (rule_id, user_id))
         status_text = "开启" if new_status else "关闭"
         await update.message.reply_text(
             f"✅ 规则 ID: {rule_id} 已被设置为 **{status_text}** 状态。",
@@ -342,3 +349,10 @@ async def list_whitelist_command(update: Update, context: ContextTypes.DEFAULT_T
         briefing_enabled_text = " (简报:开)" if user['daily_briefing_enabled'] else ""
         message += f"- <code>{user['user_id']}</code>{is_admin_text}{briefing_enabled_text}\n"
     await update.message.reply_html(message)
+
+
+@admin_only
+async def refresh_cache_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.bot_data[KEY_HIST_CACHE] = {}
+    context.bot_data[KEY_CACHE_DATE] = None
+    await update.message.reply_text("✅ 历史数据缓存已清空，下次检查时将重新获取。")

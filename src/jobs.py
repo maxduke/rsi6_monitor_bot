@@ -43,7 +43,7 @@ def _in_range(rsi_value: Union[float, int, None], rsi_min: float, rsi_max: float
         return False
     try:
         value = float(rsi_value)
-        if math.isnan(value):
+        if math.isnan(value) or math.isinf(value):
             return False
         return rsi_min <= value <= rsi_max
     except (TypeError, ValueError):
@@ -136,6 +136,7 @@ async def check_rules_job(context: ContextTypes.DEFAULT_TYPE):
         asset_code = rule['asset_code']
         current_rsi = rsi_by_code.get(asset_code)
         if current_rsi is None:
+            logger.warning(f"RSI 计算失败，跳过规则: {rule['asset_name']}({asset_code})")
             continue
 
         logger.debug(f"检查: {rule['asset_name']}({asset_code}) | RSI({RSI_PERIOD}): {current_rsi}")
