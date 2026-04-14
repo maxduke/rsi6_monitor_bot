@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import json
 import logging
 
 import httpx
@@ -30,7 +31,11 @@ def fetch_etf_history_sina(
             logger.error(f"请求新浪ETF历史净值失败: {fund_code} page={page} error={exc}")
             break
 
-        payload = response.json()
+        try:
+            payload = response.json()
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.error(f"新浪ETF历史净值JSON解析失败: {fund_code} page={page} error={exc}")
+            break
         if payload.get("code") != 0:
             logger.warning(f"新浪ETF历史净值返回错误: {fund_code} page={page} payload={payload}")
             break

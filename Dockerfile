@@ -49,4 +49,4 @@ ENV DB_FILE=/app/data/rules.db \
 USER appuser
 
 # 入口点
-CMD ["python", "src/rsi_monitor_bot.py"]
+CMD ["python", "-m", "src.main"]
