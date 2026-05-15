@@ -50,35 +50,47 @@ def _in_range(rsi_value: Union[float, int, None], rsi_min: float, rsi_max: float
         return False
 
 
+NotificationEntry = Tuple[sqlite3.Row, float, bool]
+
+
 def _build_notification_chunks(
-    rules_for_user: List[Tuple[sqlite3.Row, float]],
+    rules_for_user: List[NotificationEntry],
     max_len: int = 3500
-) -> List[Tuple[str, List[Tuple[sqlite3.Row, float]]]]:
+) -> List[Tuple[str, List[NotificationEntry]]]:
     """
     将单用户触发规则分块，避免 Telegram 4096 字符上限导致整条消息发送失败。
     """
     header = "🎯 <b>RSI 警报汇总</b> 🎯\n\n"
-    chunks: List[Tuple[str, List[Tuple[sqlite3.Row, float]]]] = []
+    chunks: List[Tuple[str, List[NotificationEntry]]] = []
     current_parts: List[str] = [header]
-    current_rules: List[Tuple[sqlite3.Row, float]] = []
+    current_rules: List[NotificationEntry] = []
 
-    for rule, current_rsi in rules_for_user:
+    for rule, current_rsi, should_increment in rules_for_user:
         safe_asset_name = html.escape(str(rule['asset_name'] or "未知资产"))
+        current_count = int(rule['notification_count'] or 0)
+        if should_increment:
+            count_text = f"{current_count + 1}/{MAX_NOTIFICATIONS_PER_TRIGGER}"
+            count_suffix = ""
+        else:
+            shown_count = min(current_count, MAX_NOTIFICATIONS_PER_TRIGGER)
+            count_text = f"{shown_count}/{MAX_NOTIFICATIONS_PER_TRIGGER}"
+            count_suffix = "（已达上限，仅汇总展示）"
+
         section = (
             f"• <b>{safe_asset_name} ({rule['asset_code']})</b>\n"
             f"  RSI({RSI_PERIOD}): <b>{current_rsi:.2f}</b>\n"
             f"  目标区间: <code>{rule['rsi_min']} - {rule['rsi_max']}</code>\n"
-            f"  通知次数: <b>{rule['notification_count'] + 1}/{MAX_NOTIFICATIONS_PER_TRIGGER}</b>\n\n"
+            f"  通知次数: <b>{count_text}</b>{count_suffix}\n\n"
         )
 
         tentative = "".join(current_parts) + section
         if len(tentative) > max_len and current_rules:
             chunks.append(("".join(current_parts).strip(), current_rules.copy()))
             current_parts = [header, section]
-            current_rules = [(rule, current_rsi)]
+            current_rules = [(rule, current_rsi, should_increment)]
         else:
             current_parts.append(section)
-            current_rules.append((rule, current_rsi))
+            current_rules.append((rule, current_rsi, should_increment))
 
     if current_rules:
         chunks.append(("".join(current_parts).strip(), current_rules.copy()))
@@ -100,7 +112,7 @@ async def check_rules_job(context: ContextTypes.DEFAULT_TYPE):
     if not active_rules:
         return
 
-    all_codes = {rule['asset_code'] for rule in active_rules}
+    all_codes = sorted({rule['asset_code'] for rule in active_rules})
 
     now = datetime.now(pytz.timezone('Asia/Shanghai'))
     hist_data_cache = ensure_daily_history_cache(context, now)
@@ -108,15 +120,16 @@ async def check_rules_job(context: ContextTypes.DEFAULT_TYPE):
 
     if codes_to_fetch_hist:
         logger.info(f"需要为 {len(codes_to_fetch_hist)} 个新资产顺序获取历史数据...")
-        for code in codes_to_fetch_hist:
+        for index, code in enumerate(codes_to_fetch_hist):
             logger.debug(f"正在获取 {code} 的历史数据...")
             data = await get_history_data(code, HIST_FETCH_DAYS)
             if data is not None and not data.empty:
                 hist_data_cache[code] = data
-            logger.debug(f"应用请求间隔: {REQUEST_INTERVAL_SECONDS}秒")
-            await asyncio.sleep(REQUEST_INTERVAL_SECONDS)
+            if index < len(codes_to_fetch_hist) - 1 and REQUEST_INTERVAL_SECONDS > 0:
+                logger.debug(f"应用请求间隔: {REQUEST_INTERVAL_SECONDS}秒")
+                await asyncio.sleep(REQUEST_INTERVAL_SECONDS)
 
-    spot_data, success = await _fetch_all_spot_data(context, list(all_codes))
+    spot_data, success = await _fetch_all_spot_data(context, all_codes)
     if not success:
         return
 
@@ -131,7 +144,7 @@ async def check_rules_job(context: ContextTypes.DEFAULT_TYPE):
         if current_rsi is not None:
             rsi_by_code[code] = current_rsi
 
-    pending_notifications: Dict[int, List[Tuple[sqlite3.Row, float]]] = defaultdict(list)
+    pending_notifications: Dict[int, List[NotificationEntry]] = defaultdict(list)
     for rule in active_rules:
         asset_code = rule['asset_code']
         current_rsi = rsi_by_code.get(asset_code)
@@ -143,9 +156,11 @@ async def check_rules_job(context: ContextTypes.DEFAULT_TYPE):
         is_triggered = _in_range(current_rsi, rule['rsi_min'], rule['rsi_max'])
         last_notified_rsi_in_range = _in_range(rule['last_notified_rsi'], rule['rsi_min'], rule['rsi_max'])
 
-        if is_triggered and rule['notification_count'] < MAX_NOTIFICATIONS_PER_TRIGGER:
-            pending_notifications[rule['user_id']].append((rule, current_rsi))
-            continue
+        if is_triggered:
+            should_increment = rule['notification_count'] < MAX_NOTIFICATIONS_PER_TRIGGER
+            pending_notifications[rule['user_id']].append((rule, current_rsi, should_increment))
+            if should_increment:
+                continue
 
         if not is_triggered and last_notified_rsi_in_range:
             logger.info(f"离开区间: {asset_code} | 重置通知计数器。")
@@ -157,6 +172,9 @@ async def check_rules_job(context: ContextTypes.DEFAULT_TYPE):
             db_execute("UPDATE rules SET last_notified_rsi = ? WHERE id = ?", (current_rsi, rule['id']))
 
     for user_id, triggered_rules in pending_notifications.items():
+        if not any(should_increment for _, _, should_increment in triggered_rules):
+            continue
+
         triggered_rules_sorted = sorted(
             triggered_rules,
             key=lambda item: (item[0]['asset_code'], item[0]['rsi_min'], item[0]['rsi_max'], item[0]['id'])
@@ -178,7 +196,9 @@ async def check_rules_job(context: ContextTypes.DEFAULT_TYPE):
                     break
 
             if sent:
-                for rule, current_rsi in rules_in_chunk:
+                for rule, current_rsi, should_increment in rules_in_chunk:
+                    if not should_increment:
+                        continue
                     logger.info(
                         f"已发送通知: {rule['asset_code']} | 用户: {user_id} | "
                         f"(第 {rule['notification_count'] + 1} 次)"

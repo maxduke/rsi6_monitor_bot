@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
 
 import sqlite3
-import pytest
-
 from src.jobs import _build_notification_chunks
 
 
@@ -35,7 +33,7 @@ class TestBuildNotificationChunks:
     def test_single_rule_one_chunk(self):
         """单条规则应在一个 chunk 中。"""
         rule = _make_mock_rule('600519', '贵州茅台', 20.0, 30.0, 0)
-        chunks = _build_notification_chunks([(rule, 25.5)])
+        chunks = _build_notification_chunks([(rule, 25.5, True)])
         assert len(chunks) == 1
         message, rules_in_chunk = chunks[0]
         assert '贵州茅台' in message
@@ -46,8 +44,8 @@ class TestBuildNotificationChunks:
     def test_multiple_rules_single_chunk(self):
         """多条较短规则应在同一个 chunk 中。"""
         rules = [
-            (_make_mock_rule('600519', '贵州茅台', 20.0, 30.0), 25.5),
-            (_make_mock_rule('000001', '平安银行', 15.0, 25.0), 18.3),
+            (_make_mock_rule('600519', '贵州茅台', 20.0, 30.0), 25.5, True),
+            (_make_mock_rule('000001', '平安银行', 15.0, 25.0), 18.3, True),
         ]
         chunks = _build_notification_chunks(rules)
         assert len(chunks) == 1
@@ -63,6 +61,7 @@ class TestBuildNotificationChunks:
             rules.append((
                 _make_mock_rule(f'{600000+i}', f'测试资产名称很长很长很长_{i}', 10.0, 90.0),
                 50.0,
+                True,
             ))
         chunks = _build_notification_chunks(rules, max_len=500)
         assert len(chunks) > 1
@@ -77,6 +76,7 @@ class TestBuildNotificationChunks:
             rules.append((
                 _make_mock_rule(f'{600000+i}', f'资产{i}', 10.0, 90.0),
                 50.0,
+                True,
             ))
         chunks = _build_notification_chunks(rules, max_len=500)
         total_rules = sum(len(r) for _, r in chunks)
@@ -85,7 +85,7 @@ class TestBuildNotificationChunks:
     def test_html_escaping(self):
         """资产名称中的 HTML 特殊字符应被转义。"""
         rule = _make_mock_rule('600519', '<script>alert(1)</script>', 20.0, 30.0)
-        chunks = _build_notification_chunks([(rule, 25.0)])
+        chunks = _build_notification_chunks([(rule, 25.0, True)])
         message, _ = chunks[0]
         assert '<script>' not in message
         assert '&lt;script&gt;' in message
@@ -93,7 +93,7 @@ class TestBuildNotificationChunks:
     def test_none_asset_name(self):
         """asset_name 为 None 时应显示"未知资产"。"""
         rule = _make_mock_rule('600519', None, 20.0, 30.0)
-        chunks = _build_notification_chunks([(rule, 25.0)])
+        chunks = _build_notification_chunks([(rule, 25.0, True)])
         message, _ = chunks[0]
         assert '未知资产' in message
 
@@ -104,7 +104,23 @@ class TestBuildNotificationChunks:
             rules.append((
                 _make_mock_rule(f'{600000+i}', f'长名称资产测试_{i}', 10.0, 90.0),
                 50.0,
+                True,
             ))
         chunks = _build_notification_chunks(rules, max_len=400)
         for message, _ in chunks:
             assert 'RSI 警报汇总' in message
+
+    def test_capped_rule_is_shown_without_increment(self):
+        """已达通知上限的规则应显示在汇总中，但标记为仅展示。"""
+        rules = [
+            (_make_mock_rule('600519', '贵州茅台', 20.0, 30.0, 1), 25.5, False),
+            (_make_mock_rule('000001', '平安银行', 15.0, 25.0, 0), 18.3, True),
+        ]
+        chunks = _build_notification_chunks(rules)
+
+        assert len(chunks) == 1
+        message, rules_in_chunk = chunks[0]
+        assert '贵州茅台' in message
+        assert '平安银行' in message
+        assert '已达上限，仅汇总展示' in message
+        assert len(rules_in_chunk) == 2
