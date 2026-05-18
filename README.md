@@ -51,7 +51,7 @@
 | `RSI_PERIOD`                  | 计算RSI指标的周期.                 | `6`    |
 | `USE_ADJUST`                  | 是否使用前复权价格 (`true`=是, `false`=否)。启用后，会将实时价格按最新交易日的复权因子转换为复权尺度。 | `true` |
 | `HIST_FETCH_DAYS`             | 获取用于计算RSI的历史数据的天数.   | `200`   |
-| `MAX_NOTIFICATIONS_PER_TRIGGER` | 单次触发区间内，发送通知的最大次数.| `1`    |
+| `MAX_NOTIFICATIONS_PER_TRIGGER` | 每个上海自然日内、单条规则处于触发区间时发送通知的最大次数；次日会自动重置。 | `1`    |
 
 ### 高级配置
 

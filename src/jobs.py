@@ -51,6 +51,43 @@ def _in_range(rsi_value: Union[float, int, None], rsi_min: float, rsi_max: float
 
 
 NotificationEntry = Tuple[sqlite3.Row, float, bool]
+SHANGHAI_TZ = pytz.timezone('Asia/Shanghai')
+
+
+def _today_shanghai_str(now: datetime = None) -> str:
+    """返回上海时区的监控日期字符串。"""
+    current = now or datetime.now(SHANGHAI_TZ)
+    if current.tzinfo is None:
+        current = SHANGHAI_TZ.localize(current)
+    else:
+        current = current.astimezone(SHANGHAI_TZ)
+    return current.strftime('%Y-%m-%d')
+
+
+def _reset_stale_notification_counts(today_str: str) -> int:
+    """跨自然日重置通知次数，避免昨日触发中的规则阻止今日再次提醒。"""
+    stale_rules = db_execute(
+        """
+        SELECT id FROM rules
+        WHERE notification_count > 0
+          AND (last_notification_date IS NULL OR last_notification_date <> ?)
+        """,
+        (today_str,),
+        fetchall=True,
+    ) or []
+    if not stale_rules:
+        return 0
+
+    db_execute(
+        """
+        UPDATE rules
+        SET notification_count = 0
+        WHERE notification_count > 0
+          AND (last_notification_date IS NULL OR last_notification_date <> ?)
+        """,
+        (today_str,),
+    )
+    return len(stale_rules)
 
 
 def _build_notification_chunks(
@@ -108,13 +145,17 @@ async def check_rules_job(context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(delay)
 
     logger.info("交易时间，开始执行规则检查...")
+    now = datetime.now(SHANGHAI_TZ)
+    today_str = _today_shanghai_str(now)
+    reset_count = _reset_stale_notification_counts(today_str)
+    if reset_count:
+        logger.info(f"已重置 {reset_count} 条跨日通知计数器，当前监控日期: {today_str}。")
+
     active_rules = db_execute("SELECT * FROM rules WHERE is_active = 1", fetchall=True)
     if not active_rules:
         return
 
     all_codes = sorted({rule['asset_code'] for rule in active_rules})
-
-    now = datetime.now(pytz.timezone('Asia/Shanghai'))
     hist_data_cache = ensure_daily_history_cache(context, now)
     codes_to_fetch_hist = [code for code in all_codes if code not in hist_data_cache]
 
@@ -165,7 +206,7 @@ async def check_rules_job(context: ContextTypes.DEFAULT_TYPE):
         if not is_triggered and last_notified_rsi_in_range:
             logger.info(f"离开区间: {asset_code} | 重置通知计数器。")
             db_execute(
-                "UPDATE rules SET last_notified_rsi = ?, notification_count = 0 WHERE id = ?",
+                "UPDATE rules SET last_notified_rsi = ?, notification_count = 0, last_notification_date = NULL WHERE id = ?",
                 (current_rsi, rule['id'])
             )
         elif is_triggered:
@@ -204,15 +245,21 @@ async def check_rules_job(context: ContextTypes.DEFAULT_TYPE):
                         f"(第 {rule['notification_count'] + 1} 次)"
                     )
                     db_execute(
-                        "UPDATE rules SET last_notified_rsi = ?, notification_count = notification_count + 1 WHERE id = ?",
-                        (current_rsi, rule['id'])
+                        """
+                        UPDATE rules
+                        SET last_notified_rsi = ?,
+                            notification_count = notification_count + 1,
+                            last_notification_date = ?
+                        WHERE id = ?
+                        """,
+                        (current_rsi, today_str, rule['id'])
                     )
 
 
 async def daily_briefing_job(context: ContextTypes.DEFAULT_TYPE):
     if not ENABLE_DAILY_BRIEFING:
         return
-    tz = pytz.timezone('Asia/Shanghai')
+    tz = SHANGHAI_TZ
     now = datetime.now(tz)
     if not is_trading_day(now):
         logger.info(f"今天 ({now.strftime('%Y-%m-%d')}) 非交易日，跳过每日简报。")

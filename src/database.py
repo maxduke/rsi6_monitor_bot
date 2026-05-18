@@ -31,8 +31,10 @@ def db_init():
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, asset_code TEXT NOT NULL,
             asset_name TEXT, rsi_min REAL NOT NULL, rsi_max REAL NOT NULL, is_active INTEGER DEFAULT 1,
             last_notified_rsi REAL DEFAULT 0, notification_count INTEGER NOT NULL DEFAULT 0,
+            last_notification_date TEXT DEFAULT NULL,
             UNIQUE(user_id, asset_code, rsi_min, rsi_max)
         )''')
+        _ensure_rules_schema(cursor)
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS whitelist (
             user_id INTEGER PRIMARY KEY,
@@ -42,6 +44,15 @@ def db_init():
             cursor.execute('INSERT OR IGNORE INTO whitelist (user_id) VALUES (?)', (ADMIN_USER_ID,))
         conn.commit()
         logger.info("数据库初始化完成。")
+
+
+def _ensure_rules_schema(cursor: sqlite3.Cursor):
+    """确保旧数据库自动补齐新增字段。"""
+    cursor.execute("PRAGMA table_info(rules)")
+    existing_columns = {row[1] for row in cursor.fetchall()}
+    if 'last_notification_date' not in existing_columns:
+        cursor.execute("ALTER TABLE rules ADD COLUMN last_notification_date TEXT DEFAULT NULL")
+        logger.info("已为 rules 表添加 last_notification_date 字段。")
 
 
 def db_execute(query, params=(), fetchone=False, fetchall=False, swallow_errors=True):

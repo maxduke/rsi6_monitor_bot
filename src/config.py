@@ -83,7 +83,7 @@ def log_config():
     logger.info(f"RSI 周期: {RSI_PERIOD}")
     logger.info(f"历史数据天数: {HIST_FETCH_DAYS}")
     logger.info(f"是否复权: {USE_ADJUST}")
-    logger.info(f"最大通知次数/次: {MAX_NOTIFICATIONS_PER_TRIGGER}")
+    logger.info(f"每日最大通知次数/规则: {MAX_NOTIFICATIONS_PER_TRIGGER}")
     logger.info(f"检查间隔: {CHECK_INTERVAL_SECONDS}秒")
     logger.info(f"数据库文件: {DB_FILE}")
     logger.info(f"最大随机延迟: {RANDOM_DELAY_MAX_SECONDS}秒")
