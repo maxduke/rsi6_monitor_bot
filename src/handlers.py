@@ -250,7 +250,11 @@ async def list_rules_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             notif_text = ""
             is_triggered = rule['rsi_min'] <= rule['last_notified_rsi'] <= rule['rsi_max']
             if is_triggered and rule['notification_count'] > 0:
-                notif_text = f"  - 触发中 (已通知: {rule['notification_count']}/{MAX_NOTIFICATIONS_PER_TRIGGER}次)\n"
+                date_text = rule['last_notification_date'] or "未知日期"
+                notif_text = (
+                    f"  - 触发中 (监控日期 {date_text} 已通知: "
+                    f"{rule['notification_count']}/{MAX_NOTIFICATIONS_PER_TRIGGER}次)\n"
+                )
             message += (
                 f"{status_icon} <b>ID: {rule['id']}</b>\n"
                 f"  - 名称: {rule['asset_name']} ({rule['asset_code']})\n"
@@ -295,7 +299,7 @@ async def toggle_rule_status_command(update: Update, context: ContextTypes.DEFAU
             return
         if new_status == 1:
             db_execute(
-                "UPDATE rules SET is_active = 1, notification_count = 0, last_notified_rsi = 0 WHERE id = ? AND user_id = ?",
+                "UPDATE rules SET is_active = 1, notification_count = 0, last_notified_rsi = 0, last_notification_date = NULL WHERE id = ? AND user_id = ?",
                 (rule_id, user_id),
             )
         else:

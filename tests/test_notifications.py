@@ -124,3 +124,95 @@ class TestBuildNotificationChunks:
         assert '平安银行' in message
         assert '已达上限，仅汇总展示' in message
         assert len(rules_in_chunk) == 2
+
+
+def _reset_test_db(monkeypatch, tmp_path):
+    """将数据库模块切换到临时 SQLite 文件。"""
+    from src import database
+
+    if database._conn is not None:
+        database._conn.close()
+        database._conn = None
+    monkeypatch.setattr(database, "DB_FILE", str(tmp_path / "rules.db"))
+    database.db_init()
+    return database
+
+
+class TestDailyNotificationReset:
+    """测试通知计数按上海自然日重置。"""
+
+    def test_reset_stale_notification_counts(self, monkeypatch, tmp_path):
+        from src.jobs import _reset_stale_notification_counts
+
+        database = _reset_test_db(monkeypatch, tmp_path)
+        database.db_execute(
+            """
+            INSERT INTO rules (
+                user_id, asset_code, asset_name, rsi_min, rsi_max,
+                last_notified_rsi, notification_count, last_notification_date
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (1, '600519', '贵州茅台', 20.0, 30.0, 25.0, 1, '2026-05-17'),
+        )
+        database.db_execute(
+            """
+            INSERT INTO rules (
+                user_id, asset_code, asset_name, rsi_min, rsi_max,
+                last_notified_rsi, notification_count, last_notification_date
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (1, '000001', '平安银行', 20.0, 30.0, 25.0, 1, '2026-05-18'),
+        )
+
+        reset_count = _reset_stale_notification_counts('2026-05-18')
+
+        assert reset_count == 1
+        stale_rule = database.db_execute(
+            "SELECT notification_count, last_notification_date FROM rules WHERE asset_code = ?",
+            ('600519',),
+            fetchone=True,
+        )
+        current_rule = database.db_execute(
+            "SELECT notification_count, last_notification_date FROM rules WHERE asset_code = ?",
+            ('000001',),
+            fetchone=True,
+        )
+        assert stale_rule['notification_count'] == 0
+        assert stale_rule['last_notification_date'] == '2026-05-17'
+        assert current_rule['notification_count'] == 1
+        assert current_rule['last_notification_date'] == '2026-05-18'
+
+    def test_db_init_migrates_existing_rules_table(self, monkeypatch, tmp_path):
+        import sqlite3
+        from src import database
+
+        db_file = tmp_path / "legacy.db"
+        conn = sqlite3.connect(db_file)
+        conn.execute(
+            """
+            CREATE TABLE rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                asset_code TEXT NOT NULL,
+                asset_name TEXT,
+                rsi_min REAL NOT NULL,
+                rsi_max REAL NOT NULL,
+                is_active INTEGER DEFAULT 1,
+                last_notified_rsi REAL DEFAULT 0,
+                notification_count INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(user_id, asset_code, rsi_min, rsi_max)
+            )
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        if database._conn is not None:
+            database._conn.close()
+            database._conn = None
+        monkeypatch.setattr(database, "DB_FILE", str(db_file))
+
+        database.db_init()
+        columns = database.db_execute("PRAGMA table_info(rules)", fetchall=True)
+
+        assert 'last_notification_date' in {column['name'] for column in columns}
